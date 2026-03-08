@@ -1,17 +1,13 @@
 #![allow(dead_code)]
-use serde::{Serialize, Deserialize};
-use std::str::FromStr;
-use alloy::primitives::{U256, Address};
+use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
+use polymarket_client_sdk::clob::types::Side as SdkSide;
 use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
-use polymarket_client_sdk::clob::types::{Side as SdkSide, AssetType};
-use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
-use polymarket_client_sdk::auth::{Credentials as SdkCredentials};
-use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::types::Decimal;
-use rust_decimal::prelude::ToPrimitive;
-use uuid::Uuid;
+use polymarket_client_sdk::POLYGON;
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 pub const COLLATERAL_DECIMALS: u8 = 6;
 
@@ -41,34 +37,60 @@ impl ClobClient {
         Self { creds }
     }
 
+    pub fn from_env() -> Result<Self, String> {
+        let private_key = std::env::var("POLY_PRIVATE_KEY")
+            .map_err(|_| "POLY_PRIVATE_KEY not found in environment".to_string())?;
+        let funder_address = std::env::var("POLY_FUNDER_ADDRESS").ok();
+
+        // Deriva o endereço a partir da private key
+        let signer = PrivateKeySigner::from_str(&private_key)
+            .map_err(|e| format!("Invalid private key: {}", e))?;
+        let address = format!("{:?}", signer.address());
+
+        // As credenciais da API não são mais necessárias - o SDK faz o gerenciamento internamente
+        Ok(Self::new(Credentials {
+            address,
+            api_key: String::new(),
+            api_secret: String::new(),
+            passphrase: String::new(),
+            private_key,
+            funder_address,
+        }))
+    }
+
     async fn get_sdk_client(&self) -> Result<SdkClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>, String> {
+        use polymarket_client_sdk::clob::types::SignatureType;
+
         let signer = PrivateKeySigner::from_str(&self.creds.private_key)
             .map_err(|e| format!("Signer error: {}", e))?
             .with_chain_id(Some(POLYGON));
 
-        let api_key_uuid = Uuid::parse_str(&self.creds.api_key)
-            .map_err(|e| format!("Invalid API Key UUID: {}", e))?;
-
-        let sdk_creds = SdkCredentials::new(
-            api_key_uuid,
-            self.creds.api_secret.clone(),
-            self.creds.passphrase.clone(),
-        );
+        eprintln!("🔑 Signer address (EOA): {:?}", signer.address());
 
         let mut auth_builder = SdkClient::new("https://clob.polymarket.com", SdkConfig::default())
             .map_err(|e| format!("Client creation error: {}", e))?
-            .authentication_builder(&signer)
-            .credentials(sdk_creds);
-            
+            .authentication_builder(&signer);
+
+        // Configura funder e signature type se fornecido
         if let Some(funder) = &self.creds.funder_address {
             if let Ok(addr) = Address::from_str(funder) {
-                auth_builder = auth_builder.funder(addr);
+                eprintln!("🏦 Usando Gnosis Safe - Funder: {:?}", addr);
+                auth_builder = auth_builder
+                    .funder(addr)
+                    .signature_type(SignatureType::GnosisSafe);
             }
+        } else {
+            eprintln!("👤 Usando EOA (sem funder)");
+            auth_builder = auth_builder.signature_type(SignatureType::Eoa);
         }
 
+        // O SDK cria/deriva automaticamente as credenciais da API
+        eprintln!("🔐 Autenticando com Polymarket...");
         let client = auth_builder.authenticate()
             .await
             .map_err(|e| format!("Authentication error: {}", e))?;
+
+        eprintln!("✅ Autenticação bem-sucedida!");
 
         Ok(client)
     }
@@ -115,21 +137,41 @@ impl ClobClient {
     }
 
     pub async fn get_balance(&self) -> Result<f64, String> {
+        use polymarket_client_sdk::clob::types::AssetType;
+        use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
+        use rust_decimal::prelude::ToPrimitive;
+
         let client = self.get_sdk_client().await?;
 
+        eprintln!("🔍 Cliente autenticado criado!");
+        eprintln!("🔍 Funder configurado: {:?}", self.creds.funder_address);
+
+        // Cria a requisição APENAS com asset_type
+        // O SDK já sabe qual signature type usar baseado na configuração do cliente
         let request = BalanceAllowanceRequest::builder()
             .asset_type(AssetType::Collateral)
             .build();
+
+        eprintln!("🔍 Fazendo requisição de balance autenticada...");
 
         let balances = client.balance_allowance(request)
             .await
             .map_err(|e| format!("Balance error: {}", e))?;
 
-        // balance is already a Decimal in BalanceAllowanceResponse
+        eprintln!("🔍 Balance response recebido!");
+        eprintln!("🔍 Balance: {:?}", balances.balance);
+
+        // O balance já vem como Decimal
         let balance_dec = balances.balance;
-        
-        // Convert Decimal (in raw units) to human readable f64
+
+        // Converte para f64 (já está em unidades de USDC com 6 decimais)
         let raw_val = balance_dec.to_f64().unwrap_or(0.0);
-        Ok(raw_val / 1_000_000.0)
+
+        // Divide por 1 milhão para converter de micro USDC para USDC
+        let final_balance = raw_val / 1_000_000.0;
+
+        eprintln!("✅ Balance final: ${:.2}", final_balance);
+
+        Ok(final_balance)
     }
 }

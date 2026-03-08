@@ -7,6 +7,10 @@ use crate::watcher::Orderbook;
 use crate::sports_ws::SportsData;
 use tokio::sync::mpsc;
 
+fn get_runtime() -> &'static tokio::runtime::Runtime {
+    crate::RUNTIME.get().expect("Runtime not initialized")
+}
+
 pub enum AppMessage {
     Sports(Vec<GammaSport>),
     Tags(Vec<GammaTag>),
@@ -16,6 +20,105 @@ pub enum AppMessage {
     SportsUpdate(SportsData),
     Balance(f64),
     Error(String),
+}
+
+pub struct LoginScreen {
+    poly_private_key: String,
+    poly_funder_address: String,
+    error_message: Option<String>,
+    is_authenticating: bool,
+    auth_result_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Result<(), String>>>,
+    should_transition: bool,
+}
+
+impl Default for LoginScreen {
+    fn default() -> Self {
+        Self {
+            poly_private_key: String::new(),
+            poly_funder_address: String::new(),
+            error_message: None,
+            is_authenticating: false,
+            auth_result_rx: None,
+            should_transition: false,
+        }
+    }
+}
+
+impl LoginScreen {
+    async fn authenticate_and_save(&self) -> Result<(), String> {
+        use std::fs::File;
+        use std::io::Write;
+        use alloy::signers::local::PrivateKeySigner;
+        use alloy::signers::Signer;
+        use std::str::FromStr;
+        use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
+        use polymarket_client_sdk::clob::types::SignatureType;
+        use polymarket_client_sdk::POLYGON;
+
+        // Cria o signer a partir da private key
+        let signer = PrivateKeySigner::from_str(&self.poly_private_key)
+            .map_err(|e| format!("Private key inválida: {}", e))?
+            .with_chain_id(Some(POLYGON));
+
+        // Obtém o endereço da carteira
+        let address = signer.address();
+
+        // Cria o cliente para autenticação
+        let client = SdkClient::new("https://clob.polymarket.com", SdkConfig::default())
+            .map_err(|e| format!("Erro ao criar cliente: {}", e))?;
+
+        // Cria o builder de autenticação
+        let mut auth_builder = client.authentication_builder(&signer);
+
+        // Configura signature type e funder
+        if !self.poly_funder_address.is_empty() {
+            if let Ok(funder_addr) = alloy::primitives::Address::from_str(&self.poly_funder_address) {
+                auth_builder = auth_builder
+                    .signature_type(SignatureType::GnosisSafe)
+                    .funder(funder_addr);
+            } else {
+                return Err("Endereço do funder inválido".to_string());
+            }
+        } else {
+            // Se não tem funder, usa EOA (signature type 0)
+            auth_builder = auth_builder.signature_type(SignatureType::Eoa);
+        }
+
+        // Testa a autenticação (cria ou deriva as credenciais automaticamente)
+        let _authenticated_client = auth_builder.authenticate()
+            .await
+            .map_err(|e| format!("Erro ao autenticar: {}", e))?;
+
+        // Se chegou aqui, a autenticação funcionou!
+        // Salva apenas o necessário no .env - o SDK gerencia as credenciais da API
+        let funder_str = if self.poly_funder_address.is_empty() {
+            format!("{:?}", address) // Usa o próprio endereço como funder
+        } else {
+            self.poly_funder_address.clone()
+        };
+
+        let env_content = format!(
+            "POLY_PRIVATE_KEY={}\nPOLY_FUNDER_ADDRESS={}\n",
+            self.poly_private_key,
+            funder_str
+        );
+
+        let mut file = File::create(".env")
+            .map_err(|e| format!("Erro ao criar arquivo .env: {}", e))?;
+        file.write_all(env_content.as_bytes())
+            .map_err(|e| format!("Erro ao escrever no .env: {}", e))?;
+
+        Ok(())
+    }
+}
+
+pub enum AppState {
+    Login(LoginScreen),
+    Main(PolyApp),
+}
+
+pub struct App {
+    state: AppState,
 }
 
 pub struct PolyApp {
@@ -62,9 +165,9 @@ impl PolyApp {
         };
 
         app.load_initial_data();
-        
+
         let tx_sports = tx.clone();
-        tokio::spawn(async move {
+        get_runtime().spawn(async move {
             if let Err(e) = crate::sports_ws::monitor_sports_egui(tx_sports).await {
                 eprintln!("Sports monitor error: {}", e);
             }
@@ -73,7 +176,7 @@ impl PolyApp {
         if let Some(c) = &app.clob {
             let clob = c.clone();
             let tx_bal = tx.clone();
-            tokio::spawn(async move {
+            get_runtime().spawn(async move {
                 if let Ok(b) = clob.get_balance().await {
                     let _ = tx_bal.send(AppMessage::Balance(b)).await;
                 }
@@ -85,7 +188,7 @@ impl PolyApp {
 
     fn load_initial_data(&self) {
         let tx = self.sender.clone();
-        tokio::spawn(async move {
+        get_runtime().spawn(async move {
             match crate::gamma::fetch_sports().await {
                 Ok(s) => { let _ = tx.send(AppMessage::Sports(s)).await; }
                 Err(e) => { let _ = tx.send(AppMessage::Error(e.to_string())).await; }
@@ -106,10 +209,10 @@ impl PolyApp {
         self.loading_tags.insert(tag_id.clone());
         let tx = self.sender.clone();
         let tid = tag_id.clone();
-        tokio::spawn(async move {
+        get_runtime().spawn(async move {
             match crate::gamma::fetch_events(Some(tid.clone())).await {
                 Ok(e) => { let _ = tx.send(AppMessage::Events(e, Some(tid))).await; }
-                Err(e) => { 
+                Err(e) => {
                     let _ = tx.send(AppMessage::Error(e.to_string())).await;
                     let _ = tx.send(AppMessage::Events(vec![], Some(tid))).await;
                 }
@@ -119,7 +222,7 @@ impl PolyApp {
 
     fn fetch_by_slug(&mut self, slug: String) {
         let tx = self.sender.clone();
-        tokio::spawn(async move {
+        get_runtime().spawn(async move {
             match crate::gamma::fetch_event_by_slug(slug).await {
                 Ok(Some(e)) => { let _ = tx.send(AppMessage::SingleEvent(e)).await; }
                 Ok(None) => { let _ = tx.send(AppMessage::Error("Slug não encontrado".to_string())).await; }
@@ -137,8 +240,8 @@ impl PolyApp {
         let size = self.stake.parse::<f64>().unwrap_or(10.0);
         let tx = self.sender.clone();
         let clob = clob.clone();
-        
-        tokio::spawn(async move {
+
+        get_runtime().spawn(async move {
             match clob.post_order(token_id, side, price, size).await {
                 Ok(resp) => { let _ = tx.send(AppMessage::Error(format!("Ordem enviada: {}", resp))).await; }
                 Err(e) => { let _ = tx.send(AppMessage::Error(format!("Erro na ordem: {}", e))).await; }
@@ -166,8 +269,172 @@ const ALLOWED_LEAGUES: &[(&str, &str)] = &[
     ("arg", "Argentina Primera"),
 ];
 
-impl eframe::App for PolyApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Verifica se existe .env com as credenciais (private key é suficiente)
+        let has_credentials = std::env::var("POLY_PRIVATE_KEY").is_ok();
+
+        let state = if has_credentials {
+            // Tenta criar o ClobClient
+            match ClobClient::from_env() {
+                Ok(clob) => AppState::Main(PolyApp::new(cc, Some(clob))),
+                Err(_) => AppState::Login(LoginScreen::default()),
+            }
+        } else {
+            AppState::Login(LoginScreen::default())
+        };
+
+        Self { state }
+    }
+
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        match &mut self.state {
+            AppState::Login(login) => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(50.0);
+                        ui.heading(RichText::new("🔐 PolyWatcher Login").size(32.0).color(Color32::from_rgb(0, 255, 255)));
+                        ui.add_space(20.0);
+                        ui.label("Configure suas credenciais da Polymarket");
+                        ui.add_space(30.0);
+                    });
+
+                    ui.add_space(20.0);
+
+                    egui::Grid::new("login_grid")
+                        .num_columns(2)
+                        .spacing([40.0, 15.0])
+                        .show(ui, |ui| {
+                            ui.label("Private Key:");
+                            ui.add(egui::TextEdit::singleline(&mut login.poly_private_key)
+                                .desired_width(500.0)
+                                .password(true)
+                                .hint_text("0x..."));
+                            ui.end_row();
+
+                            ui.label("Funder Address (opcional):");
+                            ui.add(egui::TextEdit::singleline(&mut login.poly_funder_address)
+                                .desired_width(500.0)
+                                .hint_text("0x..."));
+                            ui.end_row();
+                        });
+
+                    ui.add_space(20.0);
+
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("ℹ️ As credenciais da API serão geradas automaticamente").size(12.0).color(Color32::GRAY));
+                    });
+
+                    ui.add_space(20.0);
+
+                    ui.vertical_centered(|ui| {
+                        let button_text = if login.is_authenticating {
+                            "⏳ Autenticando..."
+                        } else {
+                            "🔐 Autenticar e Conectar"
+                        };
+
+                        let button = egui::Button::new(RichText::new(button_text).size(18.0))
+                            .min_size(egui::vec2(250.0, 45.0));
+
+                        if ui.add_enabled(!login.is_authenticating, button).clicked() {
+                            login.is_authenticating = true;
+                            login.error_message = None;
+
+                            // Cria canal para receber resultado
+                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                            login.auth_result_rx = Some(rx);
+
+                            // Clona os dados necessários para a task assíncrona
+                            let private_key = login.poly_private_key.clone();
+                            let funder_address = login.poly_funder_address.clone();
+
+                            // Executa a autenticação em background
+                            get_runtime().spawn(async move {
+                                let screen = LoginScreen {
+                                    poly_private_key: private_key,
+                                    poly_funder_address: funder_address,
+                                    error_message: None,
+                                    is_authenticating: false,
+                                    auth_result_rx: None,
+                                    should_transition: false,
+                                };
+
+                                let result = screen.authenticate_and_save().await;
+                                let _ = tx.send(result);
+                            });
+                        }
+
+                        if let Some(error) = &login.error_message {
+                            ui.add_space(10.0);
+                            let color = if error.starts_with("✅") {
+                                Color32::GREEN
+                            } else {
+                                Color32::RED
+                            };
+                            ui.label(RichText::new(error).color(color));
+                        }
+
+                        if login.is_authenticating {
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("Aguarde... Isso pode levar alguns segundos.").color(Color32::YELLOW));
+                        }
+                    });
+                });
+
+                // Verifica resultado da autenticação
+                if let Some(rx) = &mut login.auth_result_rx {
+                    if let Ok(result) = rx.try_recv() {
+                        login.is_authenticating = false;
+                        login.auth_result_rx = None;
+
+                        match result {
+                            Ok(_) => {
+                                dotenv::dotenv().ok();
+                                login.should_transition = true;
+                            }
+                            Err(e) => {
+                                login.error_message = Some(e);
+                            }
+                        }
+                    }
+                }
+
+                // Transiciona para a tela principal se autenticação foi bem-sucedida
+                if login.should_transition {
+                    match ClobClient::from_env() {
+                        Ok(_clob) => {
+                            // Não podemos criar PolyApp aqui sem CreationContext
+                            // Solução: salvar e pedir para reiniciar
+                            login.should_transition = false;
+                            login.error_message = Some("✅ Autenticação bem-sucedida! Reinicie o aplicativo.".to_string());
+
+                            // Aguarda 2 segundos e fecha
+                            let ctx_clone = ctx.clone();
+                            get_runtime().spawn(async move {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                ctx_clone.send_viewport_cmd(egui::ViewportCommand::Close);
+                            });
+                        }
+                        Err(e) => {
+                            login.should_transition = false;
+                            login.error_message = Some(format!("Erro ao carregar credenciais: {}", e));
+                        }
+                    }
+                }
+            }
+            AppState::Main(poly_app) => {
+                poly_app.update_impl(ctx, frame);
+            }
+        }
+    }
+}
+
+impl PolyApp {
+    fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
                 AppMessage::Sports(s) => self.sports = s,
@@ -289,7 +556,7 @@ impl eframe::App for PolyApp {
                                                         let tid_str = tid.to_string();
                                                         self.selected_token_id = Some(tid_str.clone());
                                                         let sender = self.sender.clone();
-                                                        tokio::spawn(async move {
+                                                        get_runtime().spawn(async move {
                                                             let _ = crate::watcher::monitor_token_egui(&tid_str, sender).await;
                                                         });
                                                     }
@@ -328,7 +595,7 @@ impl eframe::App for PolyApp {
                                     if ui.selectable_label(self.selected_token_id.as_ref() == Some(&tid_str), outcome).clicked() {
                                         self.selected_token_id = Some(tid_str.clone());
                                         let sender = self.sender.clone();
-                                        tokio::spawn(async move {
+                                        get_runtime().spawn(async move {
                                             let _ = crate::watcher::monitor_token_egui(&tid_str, sender).await;
                                         });
                                     }
