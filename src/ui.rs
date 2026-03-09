@@ -295,93 +295,110 @@ impl eframe::App for App {
             AppState::Login(login) => {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(50.0);
-                        ui.heading(RichText::new("🔐 PolyWatcher Login").size(32.0).color(Color32::from_rgb(0, 255, 255)));
-                        ui.add_space(20.0);
-                        ui.label("Configure suas credenciais da Polymarket");
-                        ui.add_space(30.0);
-                    });
+                        ui.add_space(ui.available_height() * 0.15);
 
-                    ui.add_space(20.0);
+                        let frame = egui::Frame::window(ui.style())
+                            .fill(Color32::from_rgb(25, 27, 31))
+                            .corner_radius(12)
+                            .shadow(egui::Shadow {
+                                color: Color32::from_black_alpha(150),
+                                offset: [0, 15],
+                                blur: 30,
+                                spread: 0,
+                            })
+                            .inner_margin(egui::Margin::same(30));
 
-                    egui::Grid::new("login_grid")
-                        .num_columns(2)
-                        .spacing([40.0, 15.0])
-                        .show(ui, |ui| {
-                            ui.label("Private Key:");
-                            ui.add(egui::TextEdit::singleline(&mut login.poly_private_key)
-                                .desired_width(500.0)
-                                .password(true)
-                                .hint_text("0x..."));
-                            ui.end_row();
+                        frame.show(ui, |ui| {
+                            ui.set_max_width(500.0);
 
-                            ui.label("Funder Address (opcional):");
-                            ui.add(egui::TextEdit::singleline(&mut login.poly_funder_address)
-                                .desired_width(500.0)
-                                .hint_text("0x..."));
-                            ui.end_row();
-                        });
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(10.0);
+                                ui.heading(RichText::new("🔐 PolyWatcher").size(36.0).strong().color(Color32::from_rgb(100, 181, 246)));
+                                ui.add_space(10.0);
+                                ui.label(RichText::new("Configuração de Credenciais").size(16.0).color(Color32::LIGHT_GRAY));
+                                ui.add_space(30.0);
 
-                    ui.add_space(20.0);
+                                egui::Grid::new("login_grid")
+                                    .num_columns(2)
+                                    .spacing([15.0, 20.0])
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new("Private Key:").size(15.0).color(Color32::WHITE));
+                                        ui.add(egui::TextEdit::singleline(&mut login.poly_private_key)
+                                            .desired_width(300.0)
+                                            .password(true)
+                                            .hint_text("0x..."));
+                                        ui.end_row();
 
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("ℹ️ As credenciais da API serão geradas automaticamente").size(12.0).color(Color32::GRAY));
-                    });
+                                        ui.label(RichText::new("Funder Address:").size(15.0).color(Color32::WHITE));
+                                        ui.add(egui::TextEdit::singleline(&mut login.poly_funder_address)
+                                            .desired_width(300.0)
+                                            .hint_text("0x... (opcional)"));
+                                        ui.end_row();
+                                    });
 
-                    ui.add_space(20.0);
+                                ui.add_space(30.0);
+                                ui.label(RichText::new("ⓘ As chaves da API serão geradas automaticamente").size(12.0).color(Color32::GRAY));
+                                ui.add_space(30.0);
 
-                    ui.vertical_centered(|ui| {
-                        let button_text = if login.is_authenticating {
-                            "⏳ Autenticando..."
-                        } else {
-                            "🔐 Autenticar e Conectar"
-                        };
-
-                        let button = egui::Button::new(RichText::new(button_text).size(18.0))
-                            .min_size(egui::vec2(250.0, 45.0));
-
-                        if ui.add_enabled(!login.is_authenticating, button).clicked() {
-                            login.is_authenticating = true;
-                            login.error_message = None;
-
-                            // Cria canal para receber resultado
-                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                            login.auth_result_rx = Some(rx);
-
-                            // Clona os dados necessários para a task assíncrona
-                            let private_key = login.poly_private_key.clone();
-                            let funder_address = login.poly_funder_address.clone();
-
-                            // Executa a autenticação em background
-                            get_runtime().spawn(async move {
-                                let screen = LoginScreen {
-                                    poly_private_key: private_key,
-                                    poly_funder_address: funder_address,
-                                    error_message: None,
-                                    is_authenticating: false,
-                                    auth_result_rx: None,
-                                    should_transition: false,
+                                let button_text = if login.is_authenticating {
+                                    "⏳ Autenticando..."
+                                } else {
+                                    "🔐 Autenticar e Conectar"
                                 };
 
-                                let result = screen.authenticate_and_save().await;
-                                let _ = tx.send(result);
+                                let button_color = if login.is_authenticating {
+                                    Color32::from_rgb(60, 60, 60)
+                                } else {
+                                    Color32::from_rgb(33, 150, 243)
+                                };
+
+                                let button = egui::Button::new(RichText::new(button_text).size(18.0).color(Color32::WHITE))
+                                    .fill(button_color)
+                                    .min_size(egui::vec2(250.0, 45.0))
+                                    .corner_radius(6);
+
+                                if ui.add_enabled(!login.is_authenticating, button).clicked() {
+                                    login.is_authenticating = true;
+                                    login.error_message = None;
+
+                                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                                    login.auth_result_rx = Some(rx);
+
+                                    let private_key = login.poly_private_key.clone();
+                                    let funder_address = login.poly_funder_address.clone();
+
+                                    get_runtime().spawn(async move {
+                                        let screen = LoginScreen {
+                                            poly_private_key: private_key,
+                                            poly_funder_address: funder_address,
+                                            error_message: None,
+                                            is_authenticating: false,
+                                            auth_result_rx: None,
+                                            should_transition: false,
+                                        };
+
+                                        let result = screen.authenticate_and_save().await;
+                                        let _ = tx.send(result);
+                                    });
+                                }
+
+                                if let Some(error) = &login.error_message {
+                                    ui.add_space(15.0);
+                                    let color = if error.starts_with("✅") {
+                                        Color32::from_rgb(76, 175, 80)
+                                    } else {
+                                        Color32::from_rgb(244, 67, 54)
+                                    };
+                                    ui.label(RichText::new(error).color(color));
+                                }
+
+                                if login.is_authenticating {
+                                    ui.add_space(15.0);
+                                    ui.label(RichText::new("Isso pode levar alguns segundos...").color(Color32::from_rgb(255, 213, 79)));
+                                }
+                                ui.add_space(10.0);
                             });
-                        }
-
-                        if let Some(error) = &login.error_message {
-                            ui.add_space(10.0);
-                            let color = if error.starts_with("✅") {
-                                Color32::GREEN
-                            } else {
-                                Color32::RED
-                            };
-                            ui.label(RichText::new(error).color(color));
-                        }
-
-                        if login.is_authenticating {
-                            ui.add_space(10.0);
-                            ui.label(RichText::new("Aguarde... Isso pode levar alguns segundos.").color(Color32::YELLOW));
-                        }
+                        });
                     });
                 });
 
@@ -476,7 +493,7 @@ impl PolyApp {
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("PolyWatcher").strong().size(20.0).color(Color32::from_rgb(0, 255, 255)));
+                ui.label(RichText::new("PolyWatcher").strong().size(20.0).color(Color32::from_rgb(100, 181, 246)));
                 ui.separator();
                 ui.label(format!("Wallet: {}", if self.wallet_address.is_empty() { "⚠️ Configuração necessária" } else { &self.wallet_address }));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
