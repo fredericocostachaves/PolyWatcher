@@ -47,12 +47,12 @@ impl ClobClient {
             .map_err(|_| "POLY_API_SECRET not found in environment".to_string())?;
         let passphrase = std::env::var("POLY_PASSPHRASE")
             .map_err(|_| "POLY_PASSPHRASE not found in environment".to_string())?;
-        let funder_address = std::env::var("POLY_FUNDER_ADDRESS").ok();
+        let funder_address = std::env::var("POLY_FUNDER_ADDRESS").ok().filter(|s| !s.is_empty());
 
         // Deriva o endereço a partir da private key
         let signer = PrivateKeySigner::from_str(&private_key)
             .map_err(|e| format!("Invalid private key: {}", e))?;
-        let address = format!("{:?}", signer.address());
+        let address = format!("{}", signer.address());
 
         eprintln!("📝 Carregando credenciais do .env:");
         eprintln!("  - Address (EOA): {}", address);
@@ -98,12 +98,15 @@ impl ClobClient {
             .credentials(sdk_creds);
 
         // Configura funder e signature type se fornecido
-        if let Some(funder) = &self.creds.funder_address {
+        if let Some(funder) = self.creds.funder_address.as_ref().filter(|s| !s.is_empty()) {
             if let Ok(addr) = Address::from_str(funder) {
                 eprintln!("🏦 Usando Gnosis Safe - Funder: {:?}", addr);
                 auth_builder = auth_builder
                     .funder(addr)
                     .signature_type(SignatureType::GnosisSafe);
+            } else {
+                eprintln!("⚠️ Funder address inválido: {}, usando EOA", funder);
+                auth_builder = auth_builder.signature_type(SignatureType::Eoa);
             }
         } else {
             eprintln!("👤 Usando EOA (sem funder)");

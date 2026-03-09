@@ -25,6 +25,9 @@ pub enum AppMessage {
 pub struct LoginScreen {
     poly_private_key: String,
     poly_funder_address: String,
+    poly_api_key: String,
+    poly_api_secret: String,
+    poly_passphrase: String,
     error_message: Option<String>,
     is_authenticating: bool,
     auth_result_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Result<(), String>>>,
@@ -36,6 +39,9 @@ impl Default for LoginScreen {
         Self {
             poly_private_key: String::new(),
             poly_funder_address: String::new(),
+            poly_api_key: String::new(),
+            poly_api_secret: String::new(),
+            poly_passphrase: String::new(),
             error_message: None,
             is_authenticating: false,
             auth_result_rx: None,
@@ -45,6 +51,21 @@ impl Default for LoginScreen {
 }
 
 impl LoginScreen {
+    pub fn new_from_env() -> Self {
+        use std::env;
+        Self {
+            poly_private_key: env::var("POLY_PRIVATE_KEY").unwrap_or_default(),
+            poly_funder_address: env::var("POLY_FUNDER_ADDRESS").unwrap_or_default(),
+            poly_api_key: env::var("POLY_API_KEY").unwrap_or_default(),
+            poly_api_secret: env::var("POLY_API_SECRET").unwrap_or_default(),
+            poly_passphrase: env::var("POLY_PASSPHRASE").unwrap_or_default(),
+            error_message: None,
+            is_authenticating: false,
+            auth_result_rx: None,
+            should_transition: false,
+        }
+    }
+
     async fn authenticate_and_save(&self) -> Result<(), String> {
         use std::fs::File;
         use std::io::Write;
@@ -54,14 +75,15 @@ impl LoginScreen {
         use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
         use polymarket_client_sdk::clob::types::SignatureType;
         use polymarket_client_sdk::POLYGON;
+        use polymarket_client_sdk::auth::Credentials as SdkCredentials;
+        use polymarket_client_sdk::auth::ExposeSecret;
+        use uuid::Uuid;
 
         // Cria o signer a partir da private key
         let signer = PrivateKeySigner::from_str(&self.poly_private_key)
             .map_err(|e| format!("Private key inválida: {}", e))?
             .with_chain_id(Some(POLYGON));
 
-        // Obtém o endereço da carteira
-        let address = signer.address();
 
         // Cria o cliente para autenticação
         let client = SdkClient::new("https://clob.polymarket.com", SdkConfig::default())
@@ -69,6 +91,28 @@ impl LoginScreen {
 
         // Cria o builder de autenticação
         let mut auth_builder = client.authentication_builder(&signer);
+
+        // Se o usuário forneceu as credenciais da API manualmente, usa-as
+        let has_api_creds = !self.poly_api_key.is_empty() && !self.poly_api_secret.is_empty() && !self.poly_passphrase.is_empty();
+
+        if !has_api_creds && (!self.poly_api_key.is_empty() || !self.poly_api_secret.is_empty() || !self.poly_passphrase.is_empty()) {
+            return Err("Para usar chaves manuais, você deve preencher os 3 campos: API Key, Secret e Passphrase.".to_string());
+        }
+
+        let mut _manual_creds = None;
+
+        if has_api_creds {
+            let api_key_uuid = Uuid::parse_str(&self.poly_api_key)
+                .map_err(|e| format!("API Key inválida (deve ser UUID): {}", e))?;
+            
+            let sdk_creds = SdkCredentials::new(
+                api_key_uuid,
+                self.poly_api_secret.clone(),
+                self.poly_passphrase.clone(),
+            );
+            auth_builder = auth_builder.credentials(sdk_creds.clone());
+            _manual_creds = Some(sdk_creds);
+        }
 
         // Configura signature type e funder
         if !self.poly_funder_address.is_empty() {
@@ -85,22 +129,27 @@ impl LoginScreen {
         }
 
         // Testa a autenticação (cria ou deriva as credenciais automaticamente)
-        let _authenticated_client = auth_builder.authenticate()
+        let authenticated_client = auth_builder.authenticate()
             .await
-            .map_err(|e| format!("Erro ao autenticar: {}", e))?;
+            .map_err(|e| {
+                if e.to_string().contains("503") {
+                    format!("Erro 503: O serviço de derivação está instável. Insira API Key, Secret e Passphrase manualmente para conectar.\n{}", e)
+                } else {
+                    format!("Erro ao autenticar: {}", e)
+                }
+            })?;
 
         // Se chegou aqui, a autenticação funcionou!
-        // Salva apenas o necessário no .env - o SDK gerencia as credenciais da API
-        let funder_str = if self.poly_funder_address.is_empty() {
-            format!("{:?}", address) // Usa o próprio endereço como funder
-        } else {
-            self.poly_funder_address.clone()
-        };
+        // Obtém as credenciais finais (derivadas ou manuais)
+        let final_creds = authenticated_client.credentials();
 
         let env_content = format!(
-            "POLY_PRIVATE_KEY={}\nPOLY_FUNDER_ADDRESS={}\n",
+            "POLY_PRIVATE_KEY={}\nPOLY_FUNDER_ADDRESS={}\nPOLY_API_KEY={}\nPOLY_API_SECRET={}\nPOLY_PASSPHRASE={}\n",
             self.poly_private_key,
-            funder_str
+            self.poly_funder_address, // Salva exatamente o que o usuário forneceu (ou vazio se EOA)
+            final_creds.key(),
+            final_creds.secret().expose_secret(),
+            final_creds.passphrase().expose_secret()
         );
 
         let mut file = File::create(".env")
@@ -139,10 +188,11 @@ pub struct PolyApp {
     receiver: mpsc::Receiver<AppMessage>,
     sender: mpsc::Sender<AppMessage>,
     clob: Option<ClobClient>,
+    pub logout_requested: bool,
 }
 
 impl PolyApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, clob: Option<ClobClient>) -> Self {
+    pub fn new(clob: Option<ClobClient>) -> Self {
         let (tx, rx) = mpsc::channel(100);
         let app = Self {
             sports: Vec::new(),
@@ -162,6 +212,7 @@ impl PolyApp {
             receiver: rx,
             sender: tx.clone(),
             clob,
+            logout_requested: false,
         };
 
         app.load_initial_data();
@@ -270,18 +321,18 @@ const ALLOWED_LEAGUES: &[(&str, &str)] = &[
 ];
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         // Verifica se existe .env com as credenciais (private key é suficiente)
         let has_credentials = std::env::var("POLY_PRIVATE_KEY").is_ok();
 
         let state = if has_credentials {
             // Tenta criar o ClobClient
             match ClobClient::from_env() {
-                Ok(clob) => AppState::Main(PolyApp::new(cc, Some(clob))),
-                Err(_) => AppState::Login(LoginScreen::default()),
+                Ok(clob) => AppState::Main(PolyApp::new(Some(clob))),
+                Err(_) => AppState::Login(LoginScreen::new_from_env()),
             }
         } else {
-            AppState::Login(LoginScreen::default())
+            AppState::Login(LoginScreen::new_from_env())
         };
 
         Self { state }
@@ -295,7 +346,7 @@ impl eframe::App for App {
             AppState::Login(login) => {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(ui.available_height() * 0.15);
+                        ui.add_space(ui.available_height() * 0.07);
 
                         let frame = egui::Frame::window(ui.style())
                             .fill(Color32::from_rgb(25, 27, 31))
@@ -334,10 +385,30 @@ impl eframe::App for App {
                                             .desired_width(300.0)
                                             .hint_text("0x... (opcional)"));
                                         ui.end_row();
+
+                                        ui.label(RichText::new("API Key:").size(15.0).color(Color32::WHITE));
+                                        ui.add(egui::TextEdit::singleline(&mut login.poly_api_key)
+                                            .desired_width(300.0)
+                                            .hint_text("UUID (Necessário se a derivação falhar)"));
+                                        ui.end_row();
+
+                                        ui.label(RichText::new("API Secret:").size(15.0).color(Color32::WHITE));
+                                        ui.add(egui::TextEdit::singleline(&mut login.poly_api_secret)
+                                            .desired_width(300.0)
+                                            .password(true)
+                                            .hint_text("Secret (opcional)"));
+                                        ui.end_row();
+
+                                        ui.label(RichText::new("Passphrase:").size(15.0).color(Color32::WHITE));
+                                        ui.add(egui::TextEdit::singleline(&mut login.poly_passphrase)
+                                            .desired_width(300.0)
+                                            .password(true)
+                                            .hint_text("Passphrase (opcional)"));
+                                        ui.end_row();
                                     });
 
                                 ui.add_space(30.0);
-                                ui.label(RichText::new("ⓘ As chaves da API serão geradas automaticamente").size(12.0).color(Color32::GRAY));
+                                ui.label(RichText::new("Os campos de API são gerados automaticamente via assinatura se deixados vazios, mas isso exige que o serviço da Polymarket esteja online.").size(12.0).color(Color32::GRAY));
                                 ui.add_space(30.0);
 
                                 let button_text = if login.is_authenticating {
@@ -366,11 +437,17 @@ impl eframe::App for App {
 
                                     let private_key = login.poly_private_key.clone();
                                     let funder_address = login.poly_funder_address.clone();
+                                    let api_key = login.poly_api_key.clone();
+                                    let api_secret = login.poly_api_secret.clone();
+                                    let passphrase = login.poly_passphrase.clone();
 
                                     get_runtime().spawn(async move {
                                         let screen = LoginScreen {
                                             poly_private_key: private_key,
                                             poly_funder_address: funder_address,
+                                            poly_api_key: api_key,
+                                            poly_api_secret: api_secret,
+                                            poly_passphrase: passphrase,
                                             error_message: None,
                                             is_authenticating: false,
                                             auth_result_rx: None,
@@ -423,18 +500,8 @@ impl eframe::App for App {
                 // Transiciona para a tela principal se autenticação foi bem-sucedida
                 if login.should_transition {
                     match ClobClient::from_env() {
-                        Ok(_clob) => {
-                            // Não podemos criar PolyApp aqui sem CreationContext
-                            // Solução: salvar e pedir para reiniciar
-                            login.should_transition = false;
-                            login.error_message = Some("✅ Autenticação bem-sucedida! Reinicie o aplicativo.".to_string());
-
-                            // Aguarda 2 segundos e fecha
-                            let ctx_clone = ctx.clone();
-                            get_runtime().spawn(async move {
-                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                                ctx_clone.send_viewport_cmd(egui::ViewportCommand::Close);
-                            });
+                        Ok(clob) => {
+                            self.state = AppState::Main(PolyApp::new(Some(clob)));
                         }
                         Err(e) => {
                             login.should_transition = false;
@@ -445,6 +512,17 @@ impl eframe::App for App {
             }
             AppState::Main(poly_app) => {
                 poly_app.update_impl(ctx, frame);
+                if poly_app.logout_requested {
+                    let mut login = LoginScreen::default();
+                    if let Some(clob) = &poly_app.clob {
+                        login.poly_private_key = clob.creds.private_key.clone();
+                        login.poly_funder_address = clob.creds.funder_address.clone().unwrap_or_default();
+                        login.poly_api_key = clob.creds.api_key.clone();
+                        login.poly_api_secret = clob.creds.api_secret.clone();
+                        login.poly_passphrase = clob.creds.passphrase.clone();
+                    }
+                    self.state = AppState::Login(login);
+                }
             }
         }
     }
@@ -497,7 +575,22 @@ impl PolyApp {
                 ui.separator();
                 ui.label(format!("Wallet: {}", if self.wallet_address.is_empty() { "⚠️ Configuração necessária" } else { &self.wallet_address }));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("🔄").on_hover_text("Refresh Balance").clicked() {
+                        if let Some(c) = &self.clob {
+                            let clob = c.clone();
+                            let tx_bal = self.sender.clone();
+                            get_runtime().spawn(async move {
+                                if let Ok(b) = clob.get_balance().await {
+                                    let _ = tx_bal.send(AppMessage::Balance(b)).await;
+                                }
+                            });
+                        }
+                    }
                     ui.label(RichText::new(format!("Balance: ${:.2} USDC", self.balance)).strong().color(Color32::GREEN));
+                    ui.separator();
+                    if ui.button("🚪 Logout").clicked() {
+                        self.logout_requested = true;
+                    }
                 });
             });
         });
@@ -625,31 +718,45 @@ impl PolyApp {
                 ui.separator();
 
                 let book = self.orderbook.clone();
-                egui::Grid::new("ladder").striped(true).show(ui, |ui| {
-                    ui.label("Back (Bid)");
-                    ui.label("ODDS");
-                    ui.label("Lay (Ask)");
-                    ui.end_row();
-
-                    for price_cent in (1..100).rev() {
-                        let price = price_cent as f64 / 100.0;
-                        let odds = if price > 0.0 { 1.0 / price } else { 0.0 };
-                        
-                        // Bid
-                        let bid_size = book.bids.get(&price_cent).cloned().unwrap_or_default();
-                        if ui.add(egui::Button::new(RichText::new(&bid_size).color(Color32::BLACK)).fill(Color32::from_rgb(173, 216, 230))).clicked() {
-                            self.place_order(Side::BUY, price);
-                        }
-
-                        ui.label(RichText::new(format!("{:.2} ({}¢)", odds, price_cent)).strong());
-
-                        // Ask
-                        let ask_size = book.asks.get(&price_cent).cloned().unwrap_or_default();
-                        if ui.add(egui::Button::new(RichText::new(&ask_size).color(Color32::BLACK)).fill(Color32::from_rgb(255, 182, 193))).clicked() {
-                            self.place_order(Side::SELL, price);
-                        }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("ladder").striped(true).show(ui, |ui| {
+                        ui.label(RichText::new("Back (Bid)").strong().color(Color32::from_rgb(33, 150, 243)));
+                        ui.label(RichText::new("ODDS").strong().color(Color32::WHITE));
+                        ui.label(RichText::new("Lay (Ask)").strong().color(Color32::from_rgb(244, 67, 54)));
                         ui.end_row();
-                    }
+
+                        for price_cent in (1..100).rev() {
+                            let price = price_cent as f64 / 100.0;
+                            let odds = if price > 0.0 { 1.0 / price } else { 0.0 };
+                            
+                            let bid_size = book.bids.get(&price_cent).cloned().unwrap_or_default();
+                            let ask_size = book.asks.get(&price_cent).cloned().unwrap_or_default();
+
+                            // Pula níveis sem liquidez se estiverem longe do spread? 
+                            // Por enquanto, mostra todos mas permite scroll
+                            
+                            // Bid
+                            let bid_btn = egui::Button::new(RichText::new(&bid_size).color(Color32::BLACK))
+                                .fill(if bid_size.is_empty() { Color32::TRANSPARENT } else { Color32::from_rgb(173, 216, 230) })
+                                .min_size(egui::vec2(80.0, 20.0));
+                            
+                            if ui.add(bid_btn).clicked() {
+                                self.place_order(Side::BUY, price);
+                            }
+
+                            ui.label(RichText::new(format!("{:.2} ({}¢)", odds, price_cent)).strong());
+
+                            // Ask
+                            let ask_btn = egui::Button::new(RichText::new(&ask_size).color(Color32::BLACK))
+                                .fill(if ask_size.is_empty() { Color32::TRANSPARENT } else { Color32::from_rgb(255, 182, 193) })
+                                .min_size(egui::vec2(80.0, 20.0));
+                            
+                            if ui.add(ask_btn).clicked() {
+                                self.place_order(Side::SELL, price);
+                            }
+                            ui.end_row();
+                        }
+                    });
                 });
             } else {
                 ui.centered_and_justified(|ui| {
