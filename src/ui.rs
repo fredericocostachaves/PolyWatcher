@@ -321,7 +321,20 @@ const ALLOWED_LEAGUES: &[(&str, &str)] = &[
 ];
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Configura um tema escuro customizado com fundo bem escuro para garantir contraste
+        let mut visuals = egui::Visuals::dark();
+        visuals.override_text_color = Some(Color32::from_rgb(230, 230, 230)); // Força cor de texto clara globalmente
+        visuals.panel_fill = Color32::from_rgb(15, 17, 20);  // Fundo muito escuro para os painéis
+        visuals.window_fill = Color32::from_rgb(25, 27, 31); // Fundo consistente com o frame de login
+        
+        // Melhora o contraste dos botões padrão (widgets)
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(45, 47, 51);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(65, 67, 71);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(85, 87, 91);
+        
+        cc.egui_ctx.set_visuals(visuals);
+
         // Verifica se existe .env com as credenciais (private key é suficiente)
         let has_credentials = std::env::var("POLY_PRIVATE_KEY").is_ok();
 
@@ -344,7 +357,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         match &mut self.state {
             AppState::Login(login) => {
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.fill(Color32::from_rgb(15, 17, 20)))
+                    .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ui.available_height() * 0.07);
 
@@ -408,7 +423,7 @@ impl eframe::App for App {
                                     });
 
                                 ui.add_space(30.0);
-                                ui.label(RichText::new("Os campos de API são gerados automaticamente via assinatura se deixados vazios, mas isso exige que o serviço da Polymarket esteja online.").size(12.0).color(Color32::GRAY));
+                                ui.label(RichText::new("Os campos de API são gerados automaticamente via assinatura se deixados vazios, mas isso exige que o serviço da Polymarket esteja online.").size(12.0).color(Color32::from_rgb(180, 180, 180)));
                                 ui.add_space(30.0);
 
                                 let button_text = if login.is_authenticating {
@@ -423,7 +438,7 @@ impl eframe::App for App {
                                     Color32::from_rgb(33, 150, 243)
                                 };
 
-                                let button = egui::Button::new(RichText::new(button_text).size(18.0).color(Color32::WHITE))
+                                let button = egui::Button::new(RichText::new(button_text).size(18.0).color(Color32::WHITE).strong())
                                     .fill(button_color)
                                     .min_size(egui::vec2(250.0, 45.0))
                                     .corner_radius(6);
@@ -569,13 +584,15 @@ impl PolyApp {
             }
         }
 
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+        egui::TopBottomPanel::top("header")
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(25, 27, 31)).inner_margin(8.0))
+            .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("PolyWatcher").strong().size(20.0).color(Color32::from_rgb(100, 181, 246)));
                 ui.separator();
-                ui.label(format!("Wallet: {}", if self.wallet_address.is_empty() { "⚠️ Configuração necessária" } else { &self.wallet_address }));
+                ui.label(RichText::new(format!("Wallet: {}", if self.wallet_address.is_empty() { "⚠️ Configuração necessária" } else { &self.wallet_address })).color(Color32::LIGHT_GRAY));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("🔄").on_hover_text("Refresh Balance").clicked() {
+                    if ui.button(RichText::new("🔄").color(Color32::BLACK)).on_hover_text("Refresh Balance").clicked() {
                         if let Some(c) = &self.clob {
                             let clob = c.clone();
                             let tx_bal = self.sender.clone();
@@ -588,24 +605,28 @@ impl PolyApp {
                     }
                     ui.label(RichText::new(format!("Balance: ${:.2} USDC", self.balance)).strong().color(Color32::GREEN));
                     ui.separator();
-                    if ui.button("🚪 Logout").clicked() {
+                    if ui.button(RichText::new("🚪 Logout").color(Color32::BLACK).strong()).clicked() {
                         self.logout_requested = true;
                     }
                 });
             });
         });
 
-        egui::SidePanel::left("navigator").resizable(true).default_width(250.0).show(ctx, |ui| {
+        egui::SidePanel::left("navigator")
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(20, 22, 26)).inner_margin(12.0))
+            .resizable(true)
+            .default_width(250.0)
+            .show(ctx, |ui| {
             ui.heading(RichText::new("⚡ Market Navigator").color(Color32::YELLOW));
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.search_global).hint_text("Search..."));
-                if ui.button("Clear").clicked() { self.search_global.clear(); }
+                ui.add(egui::TextEdit::singleline(&mut self.search_global).hint_text(RichText::new("Search...").color(Color32::GRAY)));
+                if ui.button(RichText::new("Clear").color(Color32::BLACK).strong()).clicked() { self.search_global.clear(); }
             });
             ui.separator();
             
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.slug_input).hint_text("Slug"));
-                if ui.button("Load").clicked() {
+                ui.add(egui::TextEdit::singleline(&mut self.slug_input).hint_text(RichText::new("Slug").color(Color32::GRAY)));
+                if ui.button(RichText::new("Load").color(Color32::BLACK).strong()).clicked() {
                     self.fetch_by_slug(self.slug_input.clone());
                 }
             });
@@ -618,7 +639,7 @@ impl PolyApp {
                     let tag_id = sport.and_then(|s| s.tags.first()).cloned().unwrap_or_default();
 
                     let header_label = format!("⚽ {}", label);
-                    let collapsing = egui::CollapsingHeader::new(header_label)
+                    let collapsing = egui::CollapsingHeader::new(RichText::new(header_label).color(Color32::WHITE).strong())
                         .id_salt(format!("league_{}", slug));
                     
                     collapsing.show(ui, |ui| {
@@ -631,11 +652,11 @@ impl PolyApp {
                                 }
                             });
                             if !has_events {
-                                if ui.button("Buscar Jogos").clicked() {
+                                if ui.button(RichText::new("Buscar Jogos").color(Color32::WHITE).strong()).clicked() {
                                     self.refresh_events(tag_id.clone());
                                 }
                                 if self.loading_tags.contains(&tag_id) {
-                                    ui.label("Carregando...");
+                                    ui.label(RichText::new("Carregando...").color(Color32::LIGHT_GRAY));
                                 }
                             }
                         }
@@ -653,11 +674,11 @@ impl PolyApp {
                             if match_tag && match_search {
                                 let ev_slug = event.slug.as_deref().unwrap_or("");
                                 let status = self.sports_updates.get(ev_slug).map(|u| u.status.as_str()).unwrap_or("Scheduled");
-                                let color = if status == "InProgress" { Color32::from_rgb(0, 255, 0) } else { Color32::GRAY };
+                                let color = if status == "InProgress" { Color32::from_rgb(0, 255, 0) } else { Color32::LIGHT_GRAY };
                                 
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new("●").color(color).size(10.0));
-                                    if ui.selectable_label(self.selected_event.as_ref().map(|e| e.id == event.id).unwrap_or(false), title).clicked() {
+                                    if ui.selectable_label(self.selected_event.as_ref().map(|e| e.id == event.id).unwrap_or(false), RichText::new(title).color(Color32::WHITE).strong()).clicked() {
                                         self.selected_event = Some(event.clone());
                                         if let Some(markets) = &event.markets {
                                             if let Some(market) = markets.first() {
@@ -682,18 +703,22 @@ impl PolyApp {
             });
         });
 
-        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("footer")
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(25, 27, 31)).inner_margin(4.0))
+            .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Status:");
+                ui.label(RichText::new("Status:").color(Color32::LIGHT_GRAY));
                 if let Some(last) = self.status_log.last() {
-                    ui.label(last);
+                    ui.label(RichText::new(last).color(Color32::WHITE));
                 }
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(15, 17, 20)).inner_margin(20.0))
+            .show(ctx, |ui| {
             if let Some(event) = &self.selected_event {
-                ui.heading(event.title.as_deref().unwrap_or("Untitled"));
+                ui.heading(RichText::new(event.title.as_deref().unwrap_or("Untitled")).color(Color32::WHITE));
                 ui.separator();
                 
                 ui.horizontal(|ui| {
@@ -702,7 +727,7 @@ impl PolyApp {
                             if let (Some(outcomes), Some(tokens)) = (&market.outcomes, &market.clob_token_ids) {
                                 for (outcome, token_id) in outcomes.iter().zip(tokens.iter()) {
                                     let tid_str = token_id.to_string();
-                                    if ui.selectable_label(self.selected_token_id.as_ref() == Some(&tid_str), outcome).clicked() {
+                                    if ui.selectable_label(self.selected_token_id.as_ref() == Some(&tid_str), RichText::new(outcome).color(Color32::WHITE).strong()).clicked() {
                                         self.selected_token_id = Some(tid_str.clone());
                                         let sender = self.sender.clone();
                                         get_runtime().spawn(async move {
@@ -736,19 +761,19 @@ impl PolyApp {
                             // Por enquanto, mostra todos mas permite scroll
                             
                             // Bid
-                            let bid_btn = egui::Button::new(RichText::new(&bid_size).color(Color32::BLACK))
-                                .fill(if bid_size.is_empty() { Color32::TRANSPARENT } else { Color32::from_rgb(173, 216, 230) })
+                            let bid_btn = egui::Button::new(RichText::new(&bid_size).color(Color32::WHITE).strong())
+                                .fill(if bid_size.is_empty() { Color32::TRANSPARENT } else { Color32::from_rgb(25, 118, 210) })
                                 .min_size(egui::vec2(80.0, 20.0));
                             
                             if ui.add(bid_btn).clicked() {
                                 self.place_order(Side::BUY, price);
                             }
 
-                            ui.label(RichText::new(format!("{:.2} ({}¢)", odds, price_cent)).strong());
+                            ui.label(RichText::new(format!("{:.2} ({}¢)", odds, price_cent)).strong().color(Color32::WHITE));
 
                             // Ask
-                            let ask_btn = egui::Button::new(RichText::new(&ask_size).color(Color32::BLACK))
-                                .fill(if ask_size.is_empty() { Color32::TRANSPARENT } else { Color32::from_rgb(255, 182, 193) })
+                            let ask_btn = egui::Button::new(RichText::new(&ask_size).color(Color32::WHITE).strong())
+                                .fill(if ask_size.is_empty() { Color32::TRANSPARENT } else { Color32::from_rgb(198, 40, 40) })
                                 .min_size(egui::vec2(80.0, 20.0));
                             
                             if ui.add(ask_btn).clicked() {
@@ -760,7 +785,7 @@ impl PolyApp {
                 });
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Selecione um evento para começar");
+                    ui.label(RichText::new("Selecione um evento para começar").color(Color32::LIGHT_GRAY).size(18.0));
                 });
             }
         });

@@ -3,6 +3,7 @@ mod gamma;
 mod watcher;
 mod sports_ws;
 mod ui;
+mod test_ws;
 
 use dotenv::dotenv;
 use crate::ui::App;
