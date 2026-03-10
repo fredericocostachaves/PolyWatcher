@@ -168,34 +168,38 @@ impl ClobClient {
         use polymarket_client_sdk::clob::types::AssetType;
         use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
         use rust_decimal::prelude::ToPrimitive;
+        use tokio::time::{timeout, Duration};
 
         let client = self.get_sdk_client().await?;
 
         eprintln!("🔍 Cliente autenticado criado!");
         eprintln!("🔍 Funder configurado: {:?}", self.creds.funder_address);
 
-        // Cria a requisição APENAS com asset_type
-        // O SDK já sabe qual signature type usar baseado na configuração do cliente
         let request = BalanceAllowanceRequest::builder()
             .asset_type(AssetType::Collateral)
             .build();
 
         eprintln!("🔍 Fazendo requisição de balance autenticada...");
 
-        let balances = client.balance_allowance(request)
-            .await
-            .map_err(|e| format!("Balance error: {}", e))?;
+        // Timeout de 5 segundos para evitar travamento eterno
+        let result = timeout(Duration::from_secs(5), client.balance_allowance(request)).await;
+
+        let balances = match result {
+            Err(_) => {
+                return Err("⏳ Timeout: o servidor do Polymarket não respondeu ao balance_allowance".into());
+            }
+            Ok(Err(e)) => {
+                return Err(format!("❌ Erro retornado pela API: {}", e));
+            }
+            Ok(Ok(b)) => b,
+        };
 
         eprintln!("🔍 Balance response recebido!");
         eprintln!("🔍 Balance: {:?}", balances.balance);
 
-        // O balance já vem como Decimal
         let balance_dec = balances.balance;
-
-        // Converte para f64 (já está em unidades de USDC com 6 decimais)
         let raw_val = balance_dec.to_f64().unwrap_or(0.0);
 
-        // Divide por 1 milhão para converter de micro USDC para USDC
         let final_balance = raw_val / 1_000_000.0;
 
         eprintln!("✅ Balance final: ${:.2}", final_balance);
