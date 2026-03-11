@@ -13,6 +13,8 @@ pub static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 fn main() -> eframe::Result<()> {
     dotenv().ok();
 
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Inicializa o runtime global do Tokio
     RUNTIME.get_or_init(|| {
         tokio::runtime::Runtime::new().unwrap()

@@ -18,7 +18,7 @@ pub enum AppMessage {
     SingleEvent(GammaEvent),
     OrderbookUpdate(Orderbook),
     SportsUpdate(SportsData),
-    Balance(f64),
+    TotalValue(f64),
     Error(String),
 }
 
@@ -30,8 +30,7 @@ pub struct LoginScreen {
     poly_passphrase: String,
     error_message: Option<String>,
     is_authenticating: bool,
-    auth_result_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Result<(), String>>>,
-    should_transition: bool,
+    auth_result_rx: Option<mpsc::UnboundedReceiver<Result<(ClobClient, f64), String>>>,
 }
 
 impl Default for LoginScreen {
@@ -45,7 +44,6 @@ impl Default for LoginScreen {
             error_message: None,
             is_authenticating: false,
             auth_result_rx: None,
-            should_transition: false,
         }
     }
 }
@@ -62,11 +60,10 @@ impl LoginScreen {
             error_message: None,
             is_authenticating: false,
             auth_result_rx: None,
-            should_transition: false,
         }
     }
 
-    async fn authenticate_and_save(&self) -> Result<(), String> {
+    async fn authenticate_and_save(&self) -> Result<ClobClient, String> {
         use std::fs::File;
         use std::io::Write;
         use alloy::signers::local::PrivateKeySigner;
@@ -139,17 +136,28 @@ impl LoginScreen {
                 }
             })?;
 
-        // Se chegou aqui, a autenticação funcionou!
-        // Obtém as credenciais finais (derivadas ou manuais)
         let final_creds = authenticated_client.credentials();
+
+        let clob = ClobClient::new(crate::clob::Credentials {
+            address: if !self.poly_funder_address.is_empty() {
+                self.poly_funder_address.to_lowercase()
+            } else {
+                format!("{:#x}", signer.address()).to_lowercase()
+            },
+            api_key: final_creds.key().to_string(),
+            api_secret: final_creds.secret().expose_secret().to_string(),
+            passphrase: final_creds.passphrase().expose_secret().to_string(),
+            private_key: self.poly_private_key.clone(),
+            funder_address: if self.poly_funder_address.is_empty() { None } else { Some(self.poly_funder_address.to_lowercase()) },
+        });
 
         let env_content = format!(
             "POLY_PRIVATE_KEY={}\nPOLY_FUNDER_ADDRESS={}\nPOLY_API_KEY={}\nPOLY_API_SECRET={}\nPOLY_PASSPHRASE={}\n",
-            self.poly_private_key,
-            self.poly_funder_address, // Salva exatamente o que o usuário forneceu (ou vazio se EOA)
-            final_creds.key(),
-            final_creds.secret().expose_secret(),
-            final_creds.passphrase().expose_secret()
+            clob.creds.private_key,
+            clob.creds.funder_address.as_deref().unwrap_or(""),
+            clob.creds.api_key,
+            clob.creds.api_secret,
+            clob.creds.passphrase
         );
 
         let mut file = File::create(".env")
@@ -157,7 +165,7 @@ impl LoginScreen {
         file.write_all(env_content.as_bytes())
             .map_err(|e| format!("Erro ao escrever no .env: {}", e))?;
 
-        Ok(())
+        Ok(clob)
     }
 }
 
@@ -179,7 +187,7 @@ pub struct PolyApp {
     selected_token_id: Option<String>,
     orderbook: Orderbook,
     sports_updates: HashMap<String, SportsData>,
-    balance: f64,
+    total_value: f64,
     wallet_address: String,
     search_global: String,
     slug_input: String,
@@ -192,8 +200,9 @@ pub struct PolyApp {
 }
 
 impl PolyApp {
-    pub fn new(clob: Option<ClobClient>) -> Self {
+    pub fn new(clob: Option<ClobClient>, initial_total_value: Option<f64>) -> Self {
         let (tx, rx) = mpsc::channel(100);
+        let total_value = initial_total_value.unwrap_or(0.0);
         let app = Self {
             sports: Vec::new(),
             tags: HashMap::new(),
@@ -203,7 +212,7 @@ impl PolyApp {
             selected_token_id: None,
             orderbook: Orderbook::default(),
             sports_updates: HashMap::new(),
-            balance: 0.0,
+            total_value,
             wallet_address: clob.as_ref().map(|c| c.creds.address.clone()).unwrap_or_default(),
             search_global: String::new(),
             slug_input: String::new(),
@@ -216,6 +225,9 @@ impl PolyApp {
         };
 
         app.load_initial_data();
+        if initial_total_value.is_none() {
+            app.refresh_total_value();
+        }
 
         let tx_sports = tx.clone();
         get_runtime().spawn(async move {
@@ -223,16 +235,6 @@ impl PolyApp {
                 eprintln!("Sports monitor error: {}", e);
             }
         });
-
-        if let Some(c) = &app.clob {
-            let clob = c.clone();
-            let tx_bal = tx.clone();
-            get_runtime().spawn(async move {
-                if let Ok(b) = clob.get_balance().await {
-                    let _ = tx_bal.send(AppMessage::Balance(b)).await;
-                }
-            });
-        }
 
         app
     }
@@ -253,6 +255,19 @@ impl PolyApp {
                 Err(e) => { let _ = tx.send(AppMessage::Error(e.to_string())).await; }
             }
         });
+    }
+
+    fn refresh_total_value(&self) {
+        if let Some(clob) = &self.clob {
+            let clob = clob.clone();
+            let tx = self.sender.clone();
+            get_runtime().spawn(async move {
+                match clob.get_total_value().await {
+                    Ok(v) => { let _ = tx.send(AppMessage::TotalValue(v)).await; }
+                    Err(e) => { let _ = tx.send(AppMessage::Error(format!("Erro ao buscar valor total: {}", e))).await; }
+                }
+            });
+        }
     }
 
     fn refresh_events(&mut self, tag_id: String) {
@@ -341,7 +356,7 @@ impl App {
         let state = if has_credentials {
             // Tenta criar o ClobClient
             match ClobClient::from_env() {
-                Ok(clob) => AppState::Main(PolyApp::new(Some(clob))),
+                Ok(clob) => AppState::Main(PolyApp::new(Some(clob), None)),
                 Err(_) => AppState::Login(LoginScreen::new_from_env()),
             }
         } else {
@@ -447,7 +462,7 @@ impl eframe::App for App {
                                     login.is_authenticating = true;
                                     login.error_message = None;
 
-                                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                                    let (tx, rx) = mpsc::unbounded_channel();
                                     login.auth_result_rx = Some(rx);
 
                                     let private_key = login.poly_private_key.clone();
@@ -466,11 +481,23 @@ impl eframe::App for App {
                                             error_message: None,
                                             is_authenticating: false,
                                             auth_result_rx: None,
-                                            should_transition: false,
                                         };
 
-                                        let result = screen.authenticate_and_save().await;
-                                        let _ = tx.send(result);
+                                        match screen.authenticate_and_save().await {
+                                            Ok(clob) => {
+                                                match clob.get_total_value().await {
+                                                    Ok(total_value) => {
+                                                        let _ = tx.send(Ok((clob, total_value)));
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx.send(Err(format!("Autenticado, mas erro ao buscar valor total: {}", e)));
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(Err(e));
+                                            }
+                                        }
                                     });
                                 }
 
@@ -501,26 +528,12 @@ impl eframe::App for App {
                         login.auth_result_rx = None;
 
                         match result {
-                            Ok(_) => {
-                                dotenv::dotenv().ok();
-                                login.should_transition = true;
+                            Ok((clob, total_value)) => {
+                                self.state = AppState::Main(PolyApp::new(Some(clob), Some(total_value)));
                             }
                             Err(e) => {
                                 login.error_message = Some(e);
                             }
-                        }
-                    }
-                }
-
-                // Transiciona para a tela principal se autenticação foi bem-sucedida
-                if login.should_transition {
-                    match ClobClient::from_env() {
-                        Ok(clob) => {
-                            self.state = AppState::Main(PolyApp::new(Some(clob)));
-                        }
-                        Err(e) => {
-                            login.should_transition = false;
-                            login.error_message = Some(format!("Erro ao carregar credenciais: {}", e));
                         }
                     }
                 }
@@ -576,7 +589,7 @@ impl PolyApp {
                 AppMessage::SportsUpdate(update) => {
                     self.sports_updates.insert(update.slug.clone(), update);
                 }
-                AppMessage::Balance(b) => self.balance = b,
+                AppMessage::TotalValue(v) => self.total_value = v,
                 AppMessage::Error(e) => {
                     self.status_log.push(e);
                     if self.status_log.len() > 20 { self.status_log.remove(0); }
@@ -592,18 +605,10 @@ impl PolyApp {
                 ui.separator();
                 ui.label(RichText::new(format!("Wallet: {}", if self.wallet_address.is_empty() { "⚠️ Configuração necessária" } else { &self.wallet_address })).color(Color32::LIGHT_GRAY));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button(RichText::new("🔄").color(Color32::BLACK)).on_hover_text("Refresh Balance").clicked() {
-                        if let Some(c) = &self.clob {
-                            let clob = c.clone();
-                            let tx_bal = self.sender.clone();
-                            get_runtime().spawn(async move {
-                                if let Ok(b) = clob.get_balance().await {
-                                    let _ = tx_bal.send(AppMessage::Balance(b)).await;
-                                }
-                            });
-                        }
+                    if ui.button(RichText::new("🔄").color(Color32::BLACK)).on_hover_text("Atualizar valor total das posições").clicked() {
+                        self.refresh_total_value();
                     }
-                    ui.label(RichText::new(format!("Balance: ${:.2} USDC", self.balance)).strong().color(Color32::GREEN));
+                    ui.label(RichText::new(format!("Valor Total Posicionado: ${:.2}", self.total_value)).strong().color(Color32::GREEN));
                     ui.separator();
                     if ui.button(RichText::new("🚪 Logout").color(Color32::BLACK).strong()).clicked() {
                         self.logout_requested = true;
@@ -758,7 +763,7 @@ impl PolyApp {
                             let ask_size = book.asks.get(&price_cent).cloned().unwrap_or_default();
 
                             // Pula níveis sem liquidez se estiverem longe do spread? 
-                            // Por enquanto, mostra todos mas permite scroll
+                            // Por enquanto, mostra todos, mas permite scroll
                             
                             // Bid
                             let bid_btn = egui::Button::new(RichText::new(&bid_size).color(Color32::WHITE).strong())
