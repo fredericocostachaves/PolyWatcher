@@ -15,7 +15,6 @@ pub enum AppMessage {
     Sports(Vec<GammaSport>),
     Tags(Vec<GammaTag>),
     Events(Vec<GammaEvent>, Option<String>),
-    SingleEvent(GammaEvent),
     OrderbookUpdate(Orderbook),
     SportsUpdate(SportsData),
     TotalValue(f64),
@@ -190,7 +189,6 @@ pub struct PolyApp {
     total_value: f64,
     wallet_address: String,
     search_global: String,
-    slug_input: String,
     stake: String,
     status_log: Vec<String>,
     receiver: mpsc::Receiver<AppMessage>,
@@ -215,7 +213,6 @@ impl PolyApp {
             total_value,
             wallet_address: clob.as_ref().map(|c| c.creds.address.clone()).unwrap_or_default(),
             search_global: String::new(),
-            slug_input: String::new(),
             stake: "10".to_string(),
             status_log: vec!["Sistema iniciado".to_string()],
             receiver: rx,
@@ -286,17 +283,6 @@ impl PolyApp {
         });
     }
 
-    fn fetch_by_slug(&mut self, slug: String) {
-        let tx = self.sender.clone();
-        get_runtime().spawn(async move {
-            match crate::gamma::fetch_event_by_slug(slug).await {
-                Ok(Some(e)) => { let _ = tx.send(AppMessage::SingleEvent(e)).await; }
-                Ok(None) => { let _ = tx.send(AppMessage::Error("Slug não encontrado".to_string())).await; }
-                Err(e) => { let _ = tx.send(AppMessage::Error(e.to_string())).await; }
-            }
-        });
-    }
-
     fn place_order(&mut self, side: Side, price: f64) {
         let Some(clob) = self.clob.as_ref() else {
             self.status_log.push("Erro: Clob não configurado".to_string());
@@ -345,8 +331,14 @@ impl App {
         
         // Melhora o contraste dos botões padrão (widgets)
         visuals.widgets.inactive.bg_fill = Color32::from_rgb(45, 47, 51);
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(230, 230, 230)); // Cor da seta e bordas
         visuals.widgets.hovered.bg_fill = Color32::from_rgb(65, 67, 71);
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, Color32::WHITE);
         visuals.widgets.active.bg_fill = Color32::from_rgb(85, 87, 91);
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, Color32::WHITE);
+        
+        // Contraste para widgets não interativos (como a seta quando não estamos interagindo)
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(210, 210, 210));
         
         cc.egui_ctx.set_visuals(visuals);
 
@@ -557,7 +549,44 @@ impl eframe::App for App {
 }
 
 impl PolyApp {
+    fn select_token(&mut self, token_id: String) {
+        self.selected_token_id = Some(token_id.clone());
+        let sender = self.sender.clone();
+        get_runtime().spawn(async move {
+            let _ = crate::watcher::monitor_token_egui(&token_id, sender).await;
+        });
+    }
+
+    fn select_event(&mut self, event: GammaEvent) {
+        self.selected_event = Some(event.clone());
+        if let Some(market) = event.markets.as_ref().and_then(|m| m.first()) {
+            if let Some(tid) = market.clob_token_ids.as_ref().and_then(|t| t.first()) {
+                self.select_token(tid.to_string());
+            }
+        }
+    }
+
+    fn draw_event_item(&self, ui: &mut egui::Ui, event: &GammaEvent) -> bool {
+        let title = event.title.as_deref().unwrap_or("Untitled");
+        let ev_slug = event.slug.as_deref().unwrap_or("");
+        let status = self.sports_updates.get(ev_slug).map(|u| u.status.as_str()).unwrap_or("Scheduled");
+        let color = if status == "InProgress" { Color32::from_rgb(0, 255, 0) } else { Color32::LIGHT_GRAY };
+        let is_selected = self.selected_event.as_ref().map(|e| e.id == event.id).unwrap_or(false);
+
+        let mut clicked = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("●").color(color).size(10.0));
+            if ui.selectable_label(is_selected, RichText::new(title).color(Color32::WHITE).strong()).clicked() {
+                clicked = true;
+            }
+        });
+        clicked
+    }
+
     fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut clicked_event = None;
+        let mut clicked_token = None;
+
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
                 AppMessage::Sports(s) => self.sports = s,
@@ -575,13 +604,6 @@ impl PolyApp {
                             self.events.push(event);
                         }
                     }
-                }
-                AppMessage::SingleEvent(e) => {
-                    if !self.events.iter().any(|existing| existing.id == e.id) {
-                        self.events.push(e.clone());
-                    }
-                    self.selected_event = Some(e);
-                    self.search_global.clear();
                 }
                 AppMessage::OrderbookUpdate(book) => {
                     self.orderbook = book;
@@ -622,23 +644,35 @@ impl PolyApp {
             .resizable(true)
             .default_width(250.0)
             .show(ctx, |ui| {
-            ui.heading(RichText::new("⚡ Market Navigator").color(Color32::YELLOW));
+            ui.heading(RichText::new("⚡ Navegar pelo Mercado").color(Color32::YELLOW));
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.search_global).hint_text(RichText::new("Search...").color(Color32::GRAY)));
                 if ui.button(RichText::new("Clear").color(Color32::BLACK).strong()).clicked() { self.search_global.clear(); }
             });
             ui.separator();
-            
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.slug_input).hint_text(RichText::new("Slug").color(Color32::GRAY)));
-                if ui.button(RichText::new("Load").color(Color32::BLACK).strong()).clicked() {
-                    self.fetch_by_slug(self.slug_input.clone());
-                }
-            });
-
-            ui.separator();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
+                if !self.search_global.is_empty() {
+                    ui.label(RichText::new("🔍 Search Results").color(Color32::from_rgb(100, 181, 246)).strong());
+                    let search_query = self.search_global.to_lowercase();
+                    let mut found_any = false;
+                    
+                    for event in &self.events {
+                        let title = event.title.as_deref().unwrap_or("Untitled");
+                        if title.to_lowercase().contains(&search_query) {
+                            found_any = true;
+                            if self.draw_event_item(ui, event) {
+                                clicked_event = Some(event.clone());
+                            }
+                        }
+                    }
+                    
+                    if !found_any {
+                        ui.label(RichText::new("No markets found").italics().color(Color32::GRAY));
+                    }
+                    ui.separator();
+                }
+
                 for (slug, label) in ALLOWED_LEAGUES {
                     let sport = self.sports.iter().find(|s| s.sport == *slug);
                     let tag_id = sport.and_then(|s| s.tags.first()).cloned().unwrap_or_default();
@@ -677,30 +711,9 @@ impl PolyApp {
                                 title.to_lowercase().contains(&self.search_global.to_lowercase());
                             
                             if match_tag && match_search {
-                                let ev_slug = event.slug.as_deref().unwrap_or("");
-                                let status = self.sports_updates.get(ev_slug).map(|u| u.status.as_str()).unwrap_or("Scheduled");
-                                let color = if status == "InProgress" { Color32::from_rgb(0, 255, 0) } else { Color32::LIGHT_GRAY };
-                                
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("●").color(color).size(10.0));
-                                    if ui.selectable_label(self.selected_event.as_ref().map(|e| e.id == event.id).unwrap_or(false), RichText::new(title).color(Color32::WHITE).strong()).clicked() {
-                                        self.selected_event = Some(event.clone());
-                                        if let Some(markets) = &event.markets {
-                                            if let Some(market) = markets.first() {
-                                                if let Some(tokens) = &market.clob_token_ids {
-                                                    if let Some(tid) = tokens.first() {
-                                                        let tid_str = tid.to_string();
-                                                        self.selected_token_id = Some(tid_str.clone());
-                                                        let sender = self.sender.clone();
-                                                        get_runtime().spawn(async move {
-                                                            let _ = crate::watcher::monitor_token_egui(&tid_str, sender).await;
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
+                                if self.draw_event_item(ui, event) {
+                                    clicked_event = Some(event.clone());
+                                }
                             }
                         }
                     });
@@ -733,11 +746,7 @@ impl PolyApp {
                                 for (outcome, token_id) in outcomes.iter().zip(tokens.iter()) {
                                     let tid_str = token_id.to_string();
                                     if ui.selectable_label(self.selected_token_id.as_ref() == Some(&tid_str), RichText::new(outcome).color(Color32::WHITE).strong()).clicked() {
-                                        self.selected_token_id = Some(tid_str.clone());
-                                        let sender = self.sender.clone();
-                                        get_runtime().spawn(async move {
-                                            let _ = crate::watcher::monitor_token_egui(&tid_str, sender).await;
-                                        });
+                                        clicked_token = Some(tid_str);
                                     }
                                 }
                             }
@@ -795,6 +804,13 @@ impl PolyApp {
             }
         });
         
+        if let Some(event) = clicked_event {
+            self.select_event(event);
+        }
+        if let Some(tid) = clicked_token {
+            self.select_token(tid);
+        }
+
         ctx.request_repaint();
     }
 }

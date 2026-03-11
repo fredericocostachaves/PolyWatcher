@@ -6,8 +6,7 @@ pub use polymarket_client_sdk::gamma::types::response::{
 };
 pub use polymarket_client_sdk::gamma::types::request::{
     EventsRequest,
-    TagsRequest,
-    EventBySlugRequest
+    TagsRequest
 };
 
 pub async fn fetch_tags() -> Result<Vec<GammaTag>, Box<dyn std::error::Error + Send + Sync>> {
@@ -41,14 +40,3 @@ pub async fn fetch_events(tag_id: Option<String>) -> Result<Vec<GammaEvent>, Box
     Ok(events)
 }
 
-pub async fn fetch_event_by_slug(slug: String) -> Result<Option<GammaEvent>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = SdkClient::default();
-    let request = EventBySlugRequest::builder()
-        .slug(slug)
-        .build();
-    
-    match client.event_by_slug(&request).await {
-        Ok(event) => Ok(Some(event)),
-        Err(_) => Ok(None),
-    }
-}

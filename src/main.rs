@@ -28,7 +28,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "PolyWatcher - Login",
+        "PolyWatcher - Futebol",
         native_options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
