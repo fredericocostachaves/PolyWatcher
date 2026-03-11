@@ -1,14 +1,19 @@
-#![allow(dead_code)]
-use alloy::primitives::{Address, U256};
+use alloy::hex;
+use alloy::hex::FromHex;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
+use alloy_dyn_abi::{DynSolType, DynSolValue};
+use alloy_primitives::{Address, Bytes, keccak256, U256};
 use polymarket_client_sdk::clob::types::Side as SdkSide;
 use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
 use polymarket_client_sdk::types::Decimal;
 use polymarket_client_sdk::POLYGON;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::str::FromStr;
 use uuid::Uuid;
+use alloy_sol_types::SolType;
 
 pub const COLLATERAL_DECIMALS: u8 = 6;
 
@@ -165,45 +170,105 @@ impl ClobClient {
     }
 
     pub async fn get_balance(&self) -> Result<f64, String> {
-        use polymarket_client_sdk::clob::types::AssetType;
-        use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
-        use rust_decimal::prelude::ToPrimitive;
-        use tokio::time::{timeout, Duration};
+        const USDC_POLYGON: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+        const POLYGON_RPC: &str = "https://polygon-rpc.com";
 
-        let client = self.get_sdk_client().await?;
+        let client = Client::new();
 
-        eprintln!("🔍 Cliente autenticado criado!");
-        eprintln!("🔍 Funder configurado: {:?}", self.creds.funder_address);
+        let user_addr = Address::from_str(&self.creds.address)
+            .map_err(|e| format!("Invalid address: {}", e))?;
 
-        let request = BalanceAllowanceRequest::builder()
-            .asset_type(AssetType::Collateral)
-            .build();
+        let usdc_addr = Address::from_str(USDC_POLYGON).unwrap();
 
-        eprintln!("🔍 Fazendo requisição de balance autenticada...");
+        // ---------------------------------------------------------
+        // 1) balanceOf(address)
+        // ---------------------------------------------------------
 
-        // Timeout de 5 segundos para evitar travamento eterno
-        let result = timeout(Duration::from_secs(5), client.balance_allowance(request)).await;
+        // selector = keccak("balanceOf(address)") first 4 bytes
+        let selector = &keccak256("balanceOf(address)".as_bytes())[0..4];
 
-        let balances = match result {
-            Err(_) => {
-                return Err("⏳ Timeout: o servidor do Polymarket não respondeu ao balance_allowance".into());
-            }
-            Ok(Err(e)) => {
-                return Err(format!("❌ Erro retornado pela API: {}", e));
-            }
-            Ok(Ok(b)) => b,
-        };
+        // encode arguments
+        let args = DynSolValue::Address(user_addr).abi_encode();
 
-        eprintln!("🔍 Balance response recebido!");
-        eprintln!("🔍 Balance: {:?}", balances.balance);
+        // build calldata
+        let mut calldata = selector.to_vec();
+        calldata.extend_from_slice(&args);
 
-        let balance_dec = balances.balance;
-        let raw_val = balance_dec.to_f64().unwrap_or(0.0);
+        // RPC call
+        let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [{
+            "to": format!("{:#x}", usdc_addr),
+            "data": format!("0x{}", hex::encode(&calldata))
+        }, "latest"]
+    });
 
-        let final_balance = raw_val / 1_000_000.0;
+        let resp = client.post(POLYGON_RPC)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| format!("RPC error: {}", e))?;
 
-        eprintln!("✅ Balance final: ${:.2}", final_balance);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        let raw_hex = json["result"].as_str().unwrap_or("0x");
+        let raw_bytes = Bytes::from_hex(raw_hex).unwrap();
 
-        Ok(final_balance)
+        let value = DynSolType::Uint(256)
+            .abi_decode(&raw_bytes)
+            .map_err(|e| format!("decode error: {}", e))?;
+
+        let raw_balance = value
+            .as_uint()
+            .ok_or("Unexpected return type for balanceOf")?;
+
+        // ---------------------------------------------------------
+        // 2) decimals()
+        // ---------------------------------------------------------
+
+        let selector = &keccak256("decimals()".as_bytes())[0..4];
+        let calldata = selector.to_vec();
+
+        let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "eth_call",
+        "params": [{
+            "to": format!("{:#x}", usdc_addr),
+            "data": format!("0x{}", hex::encode(&calldata))
+        }, "latest"]
+    });
+
+        let resp = client.post(POLYGON_RPC)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| format!("RPC error: {}", e))?;
+
+        let json: serde_json::Value = resp.json().await.unwrap();
+        let raw_hex = json["result"].as_str().unwrap_or("0x");
+        let raw_bytes = Bytes::from_hex(raw_hex).unwrap();
+
+        let value = DynSolType::Uint(8)
+            .abi_decode_value(&raw_bytes)
+            .map_err(|e| format!("decode error: {}", e))?;
+
+        let decimals_u256: alloy_primitives::U256 =
+            <alloy_sol_types::sol_data::Uint<8>>::abi_decode(&raw_bytes, false)
+                .map_err(|e| format!("decode error: {}", e))?;
+
+        let decimals = decimals_u256.to::<u64>() as u8;
+
+
+        // ---------------------------------------------------------
+        // 3) Convert to float
+        // ---------------------------------------------------------
+
+        let divisor = 10u64.pow(decimals as u32) as f64;
+        let balance_f64 = raw_balance.to::<f64>() / divisor;
+
+        Ok(balance_f64)
     }
+
 }

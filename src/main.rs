@@ -3,7 +3,6 @@ mod gamma;
 mod watcher;
 mod sports_ws;
 mod ui;
-mod test_ws;
 
 use dotenv::dotenv;
 use crate::ui::App;
@@ -13,9 +12,6 @@ pub static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn main() -> eframe::Result<()> {
     dotenv().ok();
-
-    // Requerido para rustls v0.23+ quando múltiplas features de crypto estão presentes
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // Inicializa o runtime global do Tokio
     RUNTIME.get_or_init(|| {
