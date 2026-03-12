@@ -46,7 +46,7 @@ pub async fn monitor_token_egui(token_id: &str, tx: mpsc::Sender<AppMessage>) ->
                         let p_cent = (p_float * 100.0).round() as i32;
                         current_book.asks.insert(p_cent, level.size.to_string());
                     }
-                    let _ = tx.send(AppMessage::OrderbookUpdate(current_book.clone())).await;
+                    let _ = tx.send(AppMessage::OrderbookUpdate(current_book.clone(), token_id.to_string())).await;
                 }
             }
             Some(res) = price_stream.next() => {
@@ -80,7 +80,7 @@ pub async fn monitor_token_egui(token_id: &str, tx: mpsc::Sender<AppMessage>) ->
                         }
                     }
                     if changed {
-                        let _ = tx.send(AppMessage::OrderbookUpdate(current_book.clone())).await;
+                        let _ = tx.send(AppMessage::OrderbookUpdate(current_book.clone(), token_id.to_string())).await;
                     }
                 }
             }

@@ -15,7 +15,7 @@ pub enum AppMessage {
     Sports(Vec<GammaSport>),
     Tags(Vec<GammaTag>),
     Events(Vec<GammaEvent>, Option<String>),
-    OrderbookUpdate(Orderbook),
+    OrderbookUpdate(Orderbook, String),
     SportsUpdate(SportsData),
     TotalValue(f64),
     Error(String),
@@ -558,6 +558,7 @@ impl eframe::App for App {
 impl PolyApp {
     fn select_token(&mut self, token_id: String) {
         self.selected_token_id = Some(token_id.clone());
+        self.orderbook = Orderbook::default(); // Limpa o book ao trocar de token
         let sender = self.sender.clone();
         get_runtime().spawn(async move {
             let _ = crate::watcher::monitor_token_egui(&token_id, sender).await;
@@ -607,13 +608,17 @@ impl PolyApp {
                 AppMessage::Events(e, tid) => {
                     if let Some(id) = tid { self.loading_tags.remove(&id); }
                     for event in e {
-                        if !self.events.iter().any(|existing| existing.id == event.id) {
+                        if let Some(existing) = self.events.iter_mut().find(|ex| ex.id == event.id) {
+                            *existing = event;
+                        } else {
                             self.events.push(event);
                         }
                     }
                 }
-                AppMessage::OrderbookUpdate(book) => {
-                    self.orderbook = book;
+                AppMessage::OrderbookUpdate(book, tid) => {
+                    if self.selected_token_id.as_ref() == Some(&tid) {
+                        self.orderbook = book;
+                    }
                 }
                 AppMessage::SportsUpdate(update) => {
                     self.sports_updates.insert(update.slug.clone(), update);
@@ -668,9 +673,11 @@ impl PolyApp {
                         let title = event.title.as_deref().unwrap_or("Untitled");
                         if title.to_lowercase().contains(&search_query) {
                             found_any = true;
-                            if self.draw_event_item(ui, event) {
-                                clicked_event = Some(event.clone());
-                            }
+                            ui.push_id(&event.id, |ui| {
+                                if self.draw_event_item(ui, event) {
+                                    clicked_event = Some(event.clone());
+                                }
+                            });
                         }
                     }
                     
@@ -682,7 +689,7 @@ impl PolyApp {
 
                 for (slug, label) in ALLOWED_LEAGUES {
                     let sport = self.sports.iter().find(|s| s.sport == *slug);
-                    let tag_id = sport.and_then(|s| s.tags.first()).cloned().unwrap_or_default();
+                    let tag_id = sport.and_then(|s| s.tags.last()).cloned().unwrap_or_default(); // Usa o último tag (mais específico)
 
                     let header_label = format!("⚽ {}", label);
                     let collapsing = egui::CollapsingHeader::new(RichText::new(header_label).color(Color32::WHITE).strong())
@@ -718,9 +725,11 @@ impl PolyApp {
                                 title.to_lowercase().contains(&self.search_global.to_lowercase());
                             
                             if match_tag && match_search {
-                                if self.draw_event_item(ui, event) {
-                                    clicked_event = Some(event.clone());
-                                }
+                                ui.push_id(&event.id, |ui| {
+                                    if self.draw_event_item(ui, event) {
+                                        clicked_event = Some(event.clone());
+                                    }
+                                });
                             }
                         }
                     });
@@ -746,9 +755,10 @@ impl PolyApp {
                 ui.heading(RichText::new(event.title.as_deref().unwrap_or("Untitled")).color(Color32::WHITE));
                 ui.separator();
                 
-                ui.horizontal(|ui| {
-                    if let Some(markets) = &event.markets {
-                        for market in markets {
+                if let Some(markets) = &event.markets {
+                    for market in markets {
+                        ui.label(RichText::new(market.question.as_deref().unwrap_or("Mercado")).color(Color32::YELLOW).small());
+                        ui.horizontal(|ui| {
                             if let (Some(outcomes), Some(tokens)) = (&market.outcomes, &market.clob_token_ids) {
                                 for (outcome, token_id) in outcomes.iter().zip(tokens.iter()) {
                                     let tid_str = token_id.to_string();
@@ -757,9 +767,10 @@ impl PolyApp {
                                     }
                                 }
                             }
-                        }
+                        });
+                        ui.add_space(4.0);
                     }
-                });
+                }
 
                 ui.separator();
 
