@@ -195,6 +195,7 @@ pub struct PolyApp {
     sender: mpsc::Sender<AppMessage>,
     clob: Option<ClobClient>,
     pub logout_requested: bool,
+    maximize_pending: bool,
 }
 
 impl PolyApp {
@@ -219,6 +220,7 @@ impl PolyApp {
             sender: tx.clone(),
             clob,
             logout_requested: false,
+            maximize_pending: true,
         };
 
         app.load_initial_data();
@@ -591,7 +593,47 @@ impl PolyApp {
         clicked
     }
 
+    fn event_matches_search(&self, event: &GammaEvent, query: &str) -> bool {
+        if query.is_empty() { return true; }
+        let query = query.to_lowercase();
+        
+        // 1. Busca no título do evento
+        if let Some(title) = &event.title {
+            if title.to_lowercase().contains(&query) { return true; }
+        }
+        
+        // 2. Busca no slug (contém nomes de times/liga formatados)
+        if let Some(slug) = &event.slug {
+            if slug.to_lowercase().contains(&query) { return true; }
+        }
+        
+        // 3. Busca nas tags associadas (ligas, esportes)
+        if let Some(tags) = &event.tags {
+            for tag in tags {
+                if let Some(label) = self.tags.get(&tag.id) {
+                    if label.to_lowercase().contains(&query) { return true; }
+                }
+            }
+        }
+        
+        // 4. Busca nos mercados (pergunta)
+        if let Some(markets) = &event.markets {
+            for m in markets {
+                if let Some(q) = &m.question {
+                    if q.to_lowercase().contains(&query) { return true; }
+                }
+            }
+        }
+
+        false
+    }
+
     fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.maximize_pending {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            self.maximize_pending = false;
+        }
+
         let mut clicked_event = None;
         let mut clicked_token = None;
 
@@ -666,12 +708,10 @@ impl PolyApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if !self.search_global.is_empty() {
                     ui.label(RichText::new("🔍 Search Results").color(Color32::from_rgb(100, 181, 246)).strong());
-                    let search_query = self.search_global.to_lowercase();
                     let mut found_any = false;
                     
                     for event in &self.events {
-                        let title = event.title.as_deref().unwrap_or("Untitled");
-                        if title.to_lowercase().contains(&search_query) {
+                        if self.event_matches_search(event, &self.search_global) {
                             found_any = true;
                             ui.push_id(&event.id, |ui| {
                                 if self.draw_event_item(ui, event) {
@@ -720,9 +760,7 @@ impl PolyApp {
                             } else {
                                 false
                             };
-                            let title = event.title.as_deref().unwrap_or("Untitled");
-                            let match_search = self.search_global.is_empty() || 
-                                title.to_lowercase().contains(&self.search_global.to_lowercase());
+                            let match_search = self.event_matches_search(event, &self.search_global);
                             
                             if match_tag && match_search {
                                 ui.push_id(&event.id, |ui| {
