@@ -14,6 +14,7 @@ use crate::ui::AppMessage;
 pub struct Orderbook {
     pub bids: BTreeMap<i32, String>, 
     pub asks: BTreeMap<i32, String>,
+    pub last_price: Option<f64>,
 }
 
 pub async fn monitor_token_egui(token_id: &str, tx: mpsc::Sender<AppMessage>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -75,7 +76,11 @@ pub async fn monitor_token_egui(token_id: &str, tx: mpsc::Sender<AppMessage>) ->
                                     }
                                     changed = true;
                                 }
-                                _ => {}
+                                _ => {
+                                    // Provavelmente um trade (last price)
+                                    current_book.last_price = Some(p_float);
+                                    changed = true;
+                                }
                             }
                         }
                     }

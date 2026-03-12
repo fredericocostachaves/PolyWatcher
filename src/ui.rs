@@ -18,7 +18,18 @@ pub enum AppMessage {
     OrderbookUpdate(Orderbook, String),
     SportsUpdate(SportsData),
     TotalValue(f64),
+    UsdcBalance(f64),
+    TokenBalance(f64),
+    OpenOrders(Vec<OrderSummary>),
     Error(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderSummary {
+    pub price: f64,
+    pub size: f64,
+    pub side: Side,
+    pub token_id: String,
 }
 
 pub struct LoginScreen {
@@ -110,18 +121,13 @@ impl LoginScreen {
             _manual_creds = Some(sdk_creds);
         }
 
-        // Configura signature type e funder
+        auth_builder = auth_builder.signature_type(SignatureType::Proxy);
         if !self.poly_funder_address.is_empty() {
             if let Ok(funder_addr) = alloy::primitives::Address::from_str(&self.poly_funder_address) {
-                auth_builder = auth_builder
-                    .signature_type(SignatureType::GnosisSafe)
-                    .funder(funder_addr);
+                auth_builder = auth_builder.funder(funder_addr);
             } else {
                 return Err("Endereço do funder inválido".to_string());
             }
-        } else {
-            // Se não tem funder, usa EOA (signature type 0)
-            auth_builder = auth_builder.signature_type(SignatureType::Eoa);
         }
 
         // Testa a autenticação (cria ou deriva as credenciais automaticamente)
@@ -191,11 +197,16 @@ pub struct PolyApp {
     search_global: String,
     stake: String,
     status_log: Vec<String>,
+    usdc_balance: f64,
+    selected_token_balance: f64,
+    open_orders: Vec<OrderSummary>,
     receiver: mpsc::Receiver<AppMessage>,
     sender: mpsc::Sender<AppMessage>,
     clob: Option<ClobClient>,
     pub logout_requested: bool,
     maximize_pending: bool,
+    last_data_refresh: std::time::Instant,
+    monitor_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl PolyApp {
@@ -214,19 +225,25 @@ impl PolyApp {
             total_value,
             wallet_address: clob.as_ref().map(|c| c.creds.address.clone()).unwrap_or_default(),
             search_global: String::new(),
-            stake: "10".to_string(),
+            stake: "1".to_string(),
             status_log: vec!["Sistema iniciado".to_string()],
+            usdc_balance: 0.0,
+            selected_token_balance: 0.0,
+            open_orders: Vec::new(),
             receiver: rx,
             sender: tx.clone(),
             clob,
             logout_requested: false,
             maximize_pending: true,
+            last_data_refresh: std::time::Instant::now(),
+            monitor_handle: None,
         };
 
         app.load_initial_data();
         if initial_total_value.is_none() {
             app.refresh_total_value();
         }
+        app.refresh_usdc_balance();
 
         let tx_sports = tx.clone();
         get_runtime().spawn(async move {
@@ -276,6 +293,46 @@ impl PolyApp {
         }
     }
 
+    fn refresh_usdc_balance(&mut self) {
+        if let Some(clob) = &self.clob {
+            let clob = clob.clone();
+            let tx = self.sender.clone();
+            get_runtime().spawn(async move {
+                match clob.get_usdc_balance().await {
+                    Ok(v) => { let _ = tx.send(AppMessage::UsdcBalance(v)).await; }
+                    Err(e) => { let _ = tx.send(AppMessage::Error(format!("Erro ao buscar saldo USDC: {}", e))).await; }
+                }
+            });
+        }
+    }
+
+    fn refresh_open_orders(&mut self) {
+        if let Some(clob) = &self.clob {
+            let clob = clob.clone();
+            let tx = self.sender.clone();
+            get_runtime().spawn(async move {
+                match clob.get_open_orders().await {
+                    Ok(orders) => { let _ = tx.send(AppMessage::OpenOrders(orders)).await; }
+                    Err(e) => { let _ = tx.send(AppMessage::Error(format!("Erro ao buscar ordens: {}", e))).await; }
+                }
+            });
+        }
+    }
+
+    fn refresh_token_balance(&mut self) {
+        if let (Some(clob), Some(tid)) = (&self.clob, &self.selected_token_id) {
+            let clob = clob.clone();
+            let tid = tid.clone();
+            let tx = self.sender.clone();
+            get_runtime().spawn(async move {
+                match clob.get_token_balance(&tid).await {
+                    Ok(v) => { let _ = tx.send(AppMessage::TokenBalance(v)).await; }
+                    Err(e) => { let _ = tx.send(AppMessage::Error(format!("Erro ao buscar saldo de token: {}", e))).await; }
+                }
+            });
+        }
+    }
+
     fn refresh_events(&mut self, tag_id: String) {
         if self.loading_tags.contains(&tag_id) { return; }
         self.loading_tags.insert(tag_id.clone());
@@ -298,7 +355,13 @@ impl PolyApp {
             return;
         };
         let Some(token_id) = self.selected_token_id.clone() else { return; };
-        let size = self.stake.parse::<f64>().unwrap_or(10.0);
+        let stake_val = self.stake.parse::<f64>().unwrap_or(10.0);
+        
+        // O stakeholder geralmente define quanto quer apostar em USDC.
+        // O SDK espera 'size' em shares. No Polymarket, 1 share = $1 se vencer.
+        // Logo, para apostar 'stake' dólares ao preço 'price', precisamos de 'stake / price' shares.
+        let size = if price > 0.0 { stake_val / price } else { stake_val };
+        
         let tx = self.sender.clone();
         let clob = clob.clone();
 
@@ -306,6 +369,24 @@ impl PolyApp {
             match clob.post_order(token_id, side, price, size).await {
                 Ok(resp) => { let _ = tx.send(AppMessage::Error(format!("Ordem enviada: {}", resp))).await; }
                 Err(e) => { let _ = tx.send(AppMessage::Error(format!("Erro na ordem: {}", e))).await; }
+            }
+        });
+    }
+
+    fn place_market_order(&mut self, side: Side) {
+        let Some(clob) = self.clob.as_ref() else {
+            self.status_log.push("Erro: Clob não configurado".to_string());
+            return;
+        };
+        let Some(token_id) = self.selected_token_id.clone() else { return; };
+        let size = self.stake.parse::<f64>().unwrap_or(10.0);
+        let tx = self.sender.clone();
+        let clob = clob.clone();
+
+        get_runtime().spawn(async move {
+            match clob.post_market_order(token_id, side, size).await {
+                Ok(resp) => { let _ = tx.send(AppMessage::Error(format!("Ordem a mercado enviada: {}", resp))).await; }
+                Err(e) => { let _ = tx.send(AppMessage::Error(format!("Erro na ordem a mercado: {}", e))).await; }
             }
         });
     }
@@ -559,12 +640,29 @@ impl eframe::App for App {
 
 impl PolyApp {
     fn select_token(&mut self, token_id: String) {
+        if self.selected_token_id.as_ref() == Some(&token_id) {
+            return;
+        }
+
         self.selected_token_id = Some(token_id.clone());
         self.orderbook = Orderbook::default(); // Limpa o book ao trocar de token
+        self.selected_token_balance = 0.0;      // Limpa o saldo ao trocar de token
+        self.refresh_token_balance();          // Busca o saldo do novo token imediatamente
+        self.refresh_open_orders();            // Atualiza ordens imediatamente
+
+        if let Some(handle) = self.monitor_handle.take() {
+            handle.abort();
+        }
+
         let sender = self.sender.clone();
-        get_runtime().spawn(async move {
-            let _ = crate::watcher::monitor_token_egui(&token_id, sender).await;
-        });
+        let tx_err = self.sender.clone();
+        let tid = token_id.clone();
+        self.monitor_handle = Some(get_runtime().spawn(async move {
+            if let Err(e) = crate::watcher::monitor_token_egui(&tid, sender).await {
+                let _ = tx_err.send(AppMessage::Error(format!("Erro no monitor do book: {}", e))).await;
+                eprintln!("Monitor error for {}: {}", tid, e);
+            }
+        }));
     }
 
     fn select_event(&mut self, event: GammaEvent) {
@@ -629,6 +727,13 @@ impl PolyApp {
     }
 
     fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.last_data_refresh.elapsed().as_secs() >= 10 {
+            self.refresh_usdc_balance();
+            self.refresh_token_balance();
+            self.refresh_open_orders();
+            self.last_data_refresh = std::time::Instant::now();
+        }
+
         if self.maximize_pending {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             self.maximize_pending = false;
@@ -666,6 +771,9 @@ impl PolyApp {
                     self.sports_updates.insert(update.slug.clone(), update);
                 }
                 AppMessage::TotalValue(v) => self.total_value = v,
+                AppMessage::UsdcBalance(v) => self.usdc_balance = v,
+                AppMessage::TokenBalance(v) => self.selected_token_balance = v,
+                AppMessage::OpenOrders(orders) => self.open_orders = orders,
                 AppMessage::Error(e) => {
                     self.status_log.push(e);
                     if self.status_log.len() > 20 { self.status_log.remove(0); }
@@ -789,10 +897,54 @@ impl PolyApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(15, 17, 20)).inner_margin(20.0))
             .show(ctx, |ui| {
-            if let Some(event) = &self.selected_event {
-                ui.heading(RichText::new(event.title.as_deref().unwrap_or("Untitled")).color(Color32::WHITE));
+            if let Some(event) = self.selected_event.clone() {
+                // Top Header: Event Title and USDC Balance
+                ui.horizontal(|ui| {
+                    ui.heading(RichText::new(event.title.as_deref().unwrap_or("Untitled")).color(Color32::WHITE).size(18.0));
+                    
+                    // Display Price and Spread logic from documentation
+                    let best_bid = self.orderbook.bids.keys().max().copied();
+                    let best_ask = self.orderbook.asks.keys().min().copied();
+                    
+                    if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
+                        let bid_f = bid as f64 / 100.0;
+                        let ask_f = ask as f64 / 100.0;
+                        let spread = ask_f - bid_f;
+                        let midpoint = (bid_f + ask_f) / 2.0;
+                        
+                        // "The displayed price is the midpoint of the bid-ask spread. 
+                        // If the spread is wider than $0.10, the last traded price is shown instead."
+                        let display_price = if spread > 0.10 {
+                            self.orderbook.last_price.unwrap_or(midpoint)
+                        } else {
+                            midpoint
+                        };
+                        
+                        ui.add_space(20.0);
+                        ui.label(RichText::new(format!("Price: {:.2} ({:.0}%)", display_price, display_price * 100.0))
+                            .strong().color(Color32::YELLOW).size(16.0));
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(format!("Spread: {:.2}", spread))
+                            .small().color(if spread > 0.10 { Color32::RED } else { Color32::GRAY }));
+                    } else if let Some(last) = self.orderbook.last_price {
+                        ui.add_space(20.0);
+                        ui.label(RichText::new(format!("Last: {:.2} ({:.0}%)", last, last * 100.0))
+                            .strong().color(Color32::YELLOW).size(16.0));
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{:.2} USDC", self.usdc_balance)).color(Color32::from_rgb(165, 214, 167)).strong().size(16.0));
+                            if self.selected_token_id.is_some() {
+                                ui.separator();
+                                ui.label(RichText::new(format!("Pos: {:.2} shares", self.selected_token_balance)).color(Color32::from_rgb(100, 181, 246)).strong().size(16.0));
+                            }
+                        });
+                    });
+                });
                 ui.separator();
                 
+                // Non-scrolling top part: Markets and Stake
                 if let Some(markets) = &event.markets {
                     for market in markets {
                         ui.label(RichText::new(market.question.as_deref().unwrap_or("Mercado")).color(Color32::YELLOW).small());
@@ -800,7 +952,8 @@ impl PolyApp {
                             if let (Some(outcomes), Some(tokens)) = (&market.outcomes, &market.clob_token_ids) {
                                 for (outcome, token_id) in outcomes.iter().zip(tokens.iter()) {
                                     let tid_str = token_id.to_string();
-                                    if ui.selectable_label(self.selected_token_id.as_ref() == Some(&tid_str), RichText::new(outcome).color(Color32::WHITE).strong()).clicked() {
+                                    let is_selected = self.selected_token_id.as_ref() == Some(&tid_str);
+                                    if ui.selectable_label(is_selected, RichText::new(outcome).color(Color32::WHITE).strong()).clicked() {
                                         clicked_token = Some(tid_str);
                                     }
                                 }
@@ -809,50 +962,193 @@ impl PolyApp {
                         ui.add_space(4.0);
                     }
                 }
+                
+                ui.add_space(8.0);
+                
+                // Stake Buttons
+                ui.horizontal(|ui| {
+                    for amt in ["10", "25", "50", "100", "200", "500"] {
+                        let btn = egui::Button::new(RichText::new(amt).color(Color32::WHITE).strong())
+                            .fill(Color32::from_rgb(66, 66, 66))
+                            .min_size(egui::vec2(40.0, 24.0));
+                        if ui.add(btn).clicked() {
+                            self.stake = amt.to_string();
+                        }
+                    }
+                    ui.add_space(20.0);
+                    ui.label(RichText::new("Bet: $").color(Color32::WHITE).strong());
+                    ui.add(egui::TextEdit::singleline(&mut self.stake).desired_width(80.0));
+                    
+                    ui.add_space(20.0);
+                    if ui.add(egui::Button::new(RichText::new("BUY MARKET").color(Color32::WHITE).strong())
+                        .fill(Color32::from_rgb(21, 101, 192))).clicked() {
+                        self.place_market_order(Side::BUY);
+                    }
+                    if ui.add(egui::Button::new(RichText::new("SELL MARKET").color(Color32::WHITE).strong())
+                        .fill(Color32::from_rgb(183, 28, 28))).clicked() {
+                        self.place_market_order(Side::SELL);
+                    }
+                });
 
                 ui.separator();
 
-                let book = self.orderbook.clone();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::Grid::new("ladder").striped(true).show(ui, |ui| {
-                        ui.label(RichText::new("Back (Bid)").strong().color(Color32::from_rgb(33, 150, 243)));
-                        ui.label(RichText::new("ODDS").strong().color(Color32::WHITE));
-                        ui.label(RichText::new("Lay (Ask)").strong().color(Color32::from_rgb(244, 67, 54)));
-                        ui.end_row();
+                let avail_h = ui.available_height();
+                let book_h = (avail_h * 0.70).max(200.0);
+                let orders_h = (avail_h - book_h - 20.0).max(100.0);
 
-                        for price_cent in (1..100).rev() {
-                            let price = price_cent as f64 / 100.0;
-                            let odds = if price > 0.0 { 1.0 / price } else { 0.0 };
-                            
-                            let bid_size = book.bids.get(&price_cent).cloned().unwrap_or_default();
-                            let ask_size = book.asks.get(&price_cent).cloned().unwrap_or_default();
+                // Book (Ladder) with its own ScrollArea
+                ui.label(RichText::new("ORDER BOOK (Ladder)").strong().color(Color32::WHITE));
+                egui::ScrollArea::vertical()
+                    .id_salt("book_scroll")
+                    .max_height(book_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let book = self.orderbook.clone();
+                        let stake_val: f64 = self.stake.parse().unwrap_or(0.0);
 
-                            // Pula níveis sem liquidez se estiverem longe do spread? 
-                            // Por enquanto, mostra todos, mas permite scroll
-                            
-                            // Bid
-                            let bid_btn = egui::Button::new(RichText::new(&bid_size).color(Color32::WHITE).strong())
-                                .fill(if bid_size.is_empty() { Color32::TRANSPARENT } else { Color32::from_rgb(25, 118, 210) })
-                                .min_size(egui::vec2(80.0, 20.0));
-                            
-                            if ui.add(bid_btn).clicked() {
-                                self.place_order(Side::BUY, price);
-                            }
-
-                            ui.label(RichText::new(format!("{:.2} ({}¢)", odds, price_cent)).strong().color(Color32::WHITE));
-
-                            // Ask
-                            let ask_btn = egui::Button::new(RichText::new(&ask_size).color(Color32::WHITE).strong())
-                                .fill(if ask_size.is_empty() { Color32::TRANSPARENT } else { Color32::from_rgb(198, 40, 40) })
-                                .min_size(egui::vec2(80.0, 20.0));
-                            
-                            if ui.add(ask_btn).clicked() {
-                                self.place_order(Side::SELL, price);
-                            }
+                        egui::Grid::new("ladder")
+                            .spacing([0.0, 0.0])
+                            .min_col_width(60.0)
+                            .show(ui, |ui| {
+                            // Headers
+                            ui.label(RichText::new("P/L").small().color(Color32::GRAY));
+                            ui.vertical_centered(|ui| ui.label(RichText::new("Back").strong().color(Color32::from_rgb(33, 150, 243))));
+                            ui.vertical_centered(|ui| ui.label(RichText::new("ODDS").strong().color(Color32::WHITE)));
+                            ui.vertical_centered(|ui| ui.label(RichText::new("Lay").strong().color(Color32::from_rgb(244, 67, 54))));
+                            ui.label(RichText::new("CON").small().color(Color32::GRAY));
                             ui.end_row();
-                        }
+
+                            for price_cent in 1..100 {
+                                let price = price_cent as f64 / 100.0;
+                                let odds = if price > 0.0 { 1.0 / price } else { 0.0 };
+                                
+                                let bid_size = book.bids.get(&price_cent).cloned().unwrap_or_default();
+                                let ask_size = book.asks.get(&price_cent).cloned().unwrap_or_default();
+
+                                let my_orders = self.open_orders.iter()
+                                    .filter(|o| (o.price * 100.0).round() as i32 == price_cent && Some(&o.token_id) == self.selected_token_id.as_ref())
+                                    .collect::<Vec<_>>();
+                                
+                                let is_my_bid = my_orders.iter().any(|o| o.side == Side::BUY);
+                                let is_my_ask = my_orders.iter().any(|o| o.side == Side::SELL);
+                                let my_bid_size: f64 = my_orders.iter().filter(|o| o.side == Side::BUY).map(|o| o.size).sum();
+                                let my_ask_size: f64 = my_orders.iter().filter(|o| o.side == Side::SELL).map(|o| o.size).sum();
+
+                                // P/L calculation based on liquidity
+                                let bid_size_shares = bid_size.parse::<f64>().unwrap_or(0.0);
+                                let ask_size_shares = ask_size.parse::<f64>().unwrap_or(0.0);
+                                
+                                let pl_val = if ask_size_shares > 0.0 {
+                                    // Back profit if matched against Asks
+                                    let matched_shares = (stake_val / price).min(ask_size_shares);
+                                    matched_shares * (1.0 - price)
+                                } else if bid_size_shares > 0.0 {
+                                    // Lay profit if matched against Bids
+                                    let matched_shares = (stake_val / price).min(bid_size_shares);
+                                    matched_shares * price
+                                } else {
+                                    0.0
+                                };
+                                let pl_color = if pl_val > 0.0 { Color32::from_rgb(76, 175, 80) } else { Color32::GRAY };
+                                
+                                // P/L Column
+                                ui.add_sized([50.0, 22.0], egui::Label::new(RichText::new(format!("{:+2.2}", pl_val)).color(pl_color).small()));
+
+                                // Back Column (Bids)
+                                let mut bid_label = bid_size.clone();
+                                if is_my_bid {
+                                    bid_label = format!("${:.2} {}", my_bid_size, bid_label);
+                                }
+                                let bid_btn = egui::Button::new(RichText::new(&bid_label).strong().color(if is_my_bid { Color32::YELLOW } else { Color32::WHITE }))
+                                    .fill(if is_my_bid { Color32::from_rgb(27, 94, 32) } else if bid_size.is_empty() { Color32::from_rgb(25, 27, 31) } else { Color32::from_rgb(21, 101, 192) })
+                                    .corner_radius(0.0)
+                                    .min_size(egui::vec2(80.0, 22.0));
+                                if ui.add(bid_btn).clicked() {
+                                    self.place_order(Side::BUY, price);
+                                }
+
+                                // ODDS Column
+                                let odds_text = format!("{:.2} / {}¢", odds, price_cent);
+                                let odds_btn = egui::Button::new(RichText::new(odds_text).strong().color(Color32::WHITE))
+                                    .fill(Color32::from_rgb(45, 45, 45))
+                                    .corner_radius(0.0)
+                                    .min_size(egui::vec2(100.0, 22.0));
+                                ui.add(odds_btn);
+
+                                // Lay Column (Asks)
+                                let mut ask_label = ask_size.clone();
+                                if is_my_ask {
+                                    ask_label = format!("{} ${:.2}", ask_label, my_ask_size);
+                                }
+                                let ask_btn = egui::Button::new(RichText::new(&ask_label).strong().color(if is_my_ask { Color32::YELLOW } else { Color32::WHITE }))
+                                    .fill(if is_my_ask { Color32::from_rgb(183, 28, 28) } else if ask_size.is_empty() { Color32::from_rgb(25, 27, 31) } else { Color32::from_rgb(183, 28, 28) })
+                                    .corner_radius(0.0)
+                                    .min_size(egui::vec2(80.0, 22.0));
+                                if ui.add(ask_btn).clicked() {
+                                    self.place_order(Side::SELL, price);
+                                }
+                                
+                                // CON Column placeholder
+                                ui.label("");
+
+                                ui.end_row();
+                            }
+                        });
                     });
-                });
+
+                ui.separator();
+                
+                // Open Orders with its own ScrollArea
+                ui.label(RichText::new("OPEN ORDERS (Sent)").strong().color(Color32::WHITE));
+
+                let (buy_orders, sell_orders): (Vec<_>, Vec<_>) = self.open_orders.iter()
+                    .filter(|o| Some(&o.token_id) == self.selected_token_id.as_ref())
+                    .partition(|o| o.side == Side::BUY);
+
+                egui::ScrollArea::vertical()
+                    .id_salt("orders_scroll")
+                    .max_height(orders_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.columns(2, |columns| {
+                            columns[0].vertical(|ui| {
+                                ui.label(RichText::new("Buy Orders").strong().color(Color32::from_rgb(33, 150, 243)));
+                                ui.separator();
+                                
+                                if buy_orders.is_empty() {
+                                    ui.label(RichText::new("Nenhuma ordem ativa").small().italics().color(Color32::GRAY));
+                                } else {
+                                    for o in buy_orders {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(format!("{:.2} / {}¢", 1.0/o.price, (o.price*100.0).round() as i32)).color(Color32::from_rgb(100, 181, 246)));
+                                            ui.label(RichText::new(format!("${:.2}", o.size)).color(Color32::WHITE));
+                                            if ui.button(RichText::new("X").color(Color32::RED)).clicked() {
+                                                // self.cancel_order(&o.order_id);
+                                            }
+                                        });
+                                    }
+                                }
+                            });
+                            columns[1].vertical(|ui| {
+                                ui.label(RichText::new("Sell Orders").strong().color(Color32::from_rgb(244, 67, 54)));
+                                ui.separator();
+                                
+                                if sell_orders.is_empty() {
+                                    ui.label(RichText::new("Nenhuma ordem ativa").small().italics().color(Color32::GRAY));
+                                } else {
+                                    for o in sell_orders {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(format!("{:.2} / {}¢", 1.0/o.price, (o.price*100.0).round() as i32)).color(Color32::from_rgb(255, 128, 128)));
+                                            ui.label(RichText::new(format!("${:.2}", o.size)).color(Color32::WHITE));
+                                            if ui.button(RichText::new("X").color(Color32::RED)).clicked() {
+                                                // self.cancel_order(&o.order_id);
+                                            }
+                                        });
+                                    }
+                                }
+                            });
+                        });
+                    });
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label(RichText::new("Selecione um evento para começar").color(Color32::LIGHT_GRAY).size(18.0));
