@@ -201,7 +201,7 @@ impl PolyApp {
     pub fn new(clob: Option<ClobClient>, initial_total_value: Option<f64>) -> Self {
         let (tx, rx) = mpsc::channel(100);
         let total_value = initial_total_value.unwrap_or(0.0);
-        let app = Self {
+        let mut app = Self {
             sports: Vec::new(),
             tags: HashMap::new(),
             events: Vec::new(),
@@ -254,8 +254,15 @@ impl PolyApp {
         });
     }
 
-    fn refresh_total_value(&self) {
+    fn refresh_total_value(&mut self) {
         if let Some(clob) = &self.clob {
+            // Valida se POLY_FUNDER_ADDRESS está preenchido caso seja necessário
+            if clob.creds.funder_address.is_none() || clob.creds.funder_address.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                self.status_log.push("⚠️ POLY_FUNDER_ADDRESS não está preenchido. Retornando ao login.".to_string());
+                self.logout_requested = true;
+                return;
+            }
+
             let clob = clob.clone();
             let tx = self.sender.clone();
             get_runtime().spawn(async move {
